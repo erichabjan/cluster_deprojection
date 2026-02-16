@@ -10,4 +10,4 @@
 
 source activate cl_dyn
 
-python3 /home/habjan.e/TNG/TNG_cluster_dynamics/GNN/data.py
+python3 /home/habjan.e/TNG/cluster_deprojection/deterministic_model/data.py

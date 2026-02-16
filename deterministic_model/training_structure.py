@@ -96,6 +96,7 @@ def preload_hdf5_to_memory(data_dir: str, file_in: str):
 def data_loader(
     data_dict: Dict[str, np.ndarray],
     batch_size: int,
+    rng = np.random.seed(42),
     shuffle: bool = True,
     latent_size: int = 128
 ) -> Iterator[Tuple[jraph.GraphsTuple, jnp.ndarray, jnp.ndarray]]:
@@ -103,9 +104,8 @@ def data_loader(
     n_samples = len(data_dict['nodes'])
     indices = np.arange(n_samples)
 
-    if shuffle:
-        np.random.seed(42) 
-        np.random.shuffle(indices)
+    if shuffle: 
+        rng.shuffle(indices)
 
     for i in range(0, n_samples, batch_size):
         batch_indices = indices[i:i + batch_size]
@@ -148,10 +148,10 @@ def data_loader(
 
         yield batched_graph, batched_targets, batched_masks
 
-def infinite_data_loader(data_dict, batch_size, latent_size=128, shuffle=True):
+def infinite_data_loader(data_dict, batch_size, rng, latent_size=128, shuffle=True):
     """Yield batches forever; reshuffle each pass."""
     while True:
-        yield from data_loader(data_dict, batch_size=batch_size, shuffle=shuffle, latent_size=latent_size)
+        yield from data_loader(data_dict, batch_size=batch_size, rng=rng, shuffle=shuffle, latent_size=latent_size)
 
 
 def create_train_state(model, rng_key, learning_rate, grad_clipping, example_graph):
@@ -188,8 +188,8 @@ def mse_loss(params, graph, target, mask, apply_fn, training, rng=None):
 
     return loss
 
-def tree_l2_norm(tree):
-    return jnp.sqrt(sum([jnp.vdot(x, x) for x in tree_leaves(tree)]))
+#def tree_l2_norm(tree):
+ #   return jnp.sqrt(sum([jnp.vdot(x, x) for x in tree_leaves(tree)]))
 
 @jax.jit
 def train_step(state, graph, target, mask, rng_key):
@@ -256,20 +256,22 @@ def train_model(
             },
             )
     
-    train_stream = infinite_data_loader(train_data, batch_size, latent_size=latent_size, shuffle=True)
+    train_rng = np.random.default_rng(42)
+    train_stream = infinite_data_loader(train_data, batch_size, rng=train_rng, latent_size=latent_size, shuffle=True)
+    val_rng = np.random.default_rng(123)
 
     def eval_loop():
         total = 0.0
         count = 0
         if num_eval_batches is None:
             # Full pass
-            for graph, tgt, mask in data_loader(test_data, batch_size, shuffle=True, latent_size=latent_size):
+            for graph, tgt, mask in data_loader(test_data, batch_size, rng=val_rng, shuffle=True, latent_size=latent_size):
                 loss_val = eval_step(state, graph, tgt, mask)
                 total += float(loss_val)
                 count += 1
         else:
             # First num_eval_batches batches of the deterministic loader
-            it = data_loader(test_data, batch_size, shuffle=True, latent_size=latent_size)
+            it = data_loader(test_data, batch_size, rng=val_rng, shuffle=True, latent_size=latent_size)
             for _ in range(num_eval_batches):
                 try:
                     graph, tgt, mask = next(it)

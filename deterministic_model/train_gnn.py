@@ -16,7 +16,7 @@ from training_structure import train_model, data_loader, create_train_state, tra
 from gnn import GraphConvNet
 
 ### Add a suffix for a new model
-suffix = '_testing_newdata'
+suffix = '_testing_grad_clip'
 
 ### Import data and create data loaders
 data_path = "/projects/mccleary_group/habjan.e/TNG/Data/GNN_SBI_data/"
@@ -45,7 +45,7 @@ if __name__ == "__main__":
                          attention = True,
                          shared_weights = True,
                          relative_updates = False,
-                         output_dim = 2,
+                         output_dim = 3,
                          dropout_rate = 0.0)
 
 
@@ -53,21 +53,21 @@ if __name__ == "__main__":
     batch_size = 4
 
     early_stopping = False
-    patience = 50
+    patience = 200
     num_train_steps = 50_000
     eval_every = 25
     log_every = 50
-    num_eval_batches = 100
+    num_eval_batches = 250
 
-    learning_rate = learning_rate = optax.cosine_decay_schedule(init_value=1e-3,decay_steps=int(num_train_steps * 0.9), alpha=0.1)
-    gradient_clipping = 1
+    learning_rate = optax.cosine_decay_schedule(init_value=1e-3,decay_steps=int(num_train_steps * 0.9), alpha=0.1)
+    gradient_clipping = 100
 
     ### Weights and Biases Notes
     wandb_notes = (
         "Learning rate decay run. "
         f"hidden_size={hidden_size}, num_mlp_layers={num_mlp_layers}. "
-        f"learning_rate={learning_rate}. "
-        "Same as baseline run, except shared_weights = True, no early stoppinf=g, fixed velocities"
+        f"learning_rate={learning_rate}. gradient_clipping = {gradient_clipping}"
+        "Same as baseline run, except shared_weights = True, no early stopping, 3D"
     )
 
     trained_state, model, train_losses, test_losses = train_model(

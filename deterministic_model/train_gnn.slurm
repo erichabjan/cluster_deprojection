@@ -35,4 +35,4 @@ nvidia-smi  # Show GPU state before running
 python -c "import jax; print('JAX version:', jax.__version__); print('Available devices:', jax.devices()); print('Using GPU:', any(d.platform == 'gpu' for d in jax.devices()))"
 
 # Run your JAX script
-python3 /home/habjan.e/TNG/TNG_cluster_dynamics/GNN/train_gnn.py
+python3 /home/habjan.e/TNG/cluster_deprojection/deterministic_model/train_gnn.py

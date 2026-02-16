@@ -248,7 +248,8 @@ for cluster_idx in cluster_inds:
             inputs  = np.stack((x_ro_pos, y_ro_pos, z_ro_vel),  axis=-1)
 
             # (z, v_x, v_y)
-            targets = np.stack((r_ro_zscore, v_ro_zscore),  axis=-1)
+            #targets = np.stack((r_ro_zscore, v_ro_zscore),  axis=-1)
+            targets = np.stack((z_ro_pos, x_ro_vel, y_ro_vel),  axis=-1)
 
             g = make_graph(inputs)
             padded_graph, node_mask = pad_batch([g], MAX_NODES, MAX_EDGES)
