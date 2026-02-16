@@ -36,3 +36,4 @@ python -c "import jax; print('JAX version:', jax.__version__); print('Available 
 
 # Run your JAX script
 python3 /home/habjan.e/TNG/cluster_deprojection/probabilistic_model/train_cfm_model.py
+python3 /home/habjan.e/TNG/cluster_deprojection/probabilistic_model/cfm_eval.py

@@ -14,10 +14,8 @@ from cfm_training_structure import (
 from cfm_gnn import GraphConvNet, CFMGraphModel
 
 
-# Add a suffix for a new model
 suffix = "_cfm_testing"
 
-# Data paths
 data_path = "/projects/mccleary_group/habjan.e/TNG/Data/GNN_SBI_data/"
 train_file = "GNN_data_train.h5"
 test_file = "GNN_data_test.h5"
@@ -28,13 +26,12 @@ if __name__ == "__main__":
     train_data = preload_hdf5_to_memory(data_path, train_file)
     test_data = preload_hdf5_to_memory(data_path, test_file)
 
-    # Model parameters (keep same style as your point-estimator)
     hidden_size = 1024
     num_mlp_layers = 3
     latent_size = 128
-    target_dim = 3  # (z, vx, vy)
+    target_dim = 3
+    time_emb_dim = 128
 
-    # Backbone is your same GraphConvNet, but now it predicts a vector field in target space
     backbone = GraphConvNet(
         latent_size=latent_size,
         hidden_size=hidden_size,
@@ -46,18 +43,16 @@ if __name__ == "__main__":
         attention=True,
         shared_weights=True,
         relative_updates=False,
-        output_dim=target_dim,      # IMPORTANT: vector field dim == target dim
+        output_dim=target_dim,
         dropout_rate=0.0,
     )
 
-    # CFM wrapper adds (x_t, t) conditioning into node features
     model = CFMGraphModel(
         backbone=backbone,
         target_dim=target_dim,
-        time_emb_dim=32,
+        time_emb_dim=time_emb_dim,
     )
 
-    # Training parameters
     batch_size = 4
     early_stopping = True
     patience = 200
@@ -72,6 +67,7 @@ if __name__ == "__main__":
     wandb_notes = (
         "CFM run (linear-path flow matching). "
         f"hidden_size={hidden_size}, num_mlp_layers={num_mlp_layers}, latent_size={latent_size}. "
+        f"time_emb_dim={time_emb_dim}."
         f"learning_rate={learning_rate}. "
         "Backbone: same ConvGNN; wrapper adds (x_t, t) conditioning."
     )

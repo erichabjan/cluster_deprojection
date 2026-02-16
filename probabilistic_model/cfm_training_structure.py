@@ -13,9 +13,6 @@ import wandb
 import functools
 
 
-# -------------------------
-# Data utilities (same as your current training_structure.py)
-# -------------------------
 def preload_hdf5_to_memory(data_dir: str, file_in: str):
     print(f"\nPreloading {file_in} into memory...")
     start = time.time()
@@ -133,7 +130,7 @@ def infinite_data_loader(data_dict, batch_size, shuffle=True):
 
 
 def create_train_state(model, rng_key, learning_rate, grad_clipping, example_graph, target_dim: int = 3):
-    # dummy inputs for init
+
     n_total = example_graph.nodes.shape[0]
     x_t0 = jnp.zeros((n_total, target_dim), dtype=jnp.float32)
     t0 = jnp.zeros((n_total, 1), dtype=jnp.float32)
@@ -146,36 +143,30 @@ def create_train_state(model, rng_key, learning_rate, grad_clipping, example_gra
     return train_state.TrainState.create(apply_fn=model.apply, params=params, tx=optimizer)
 
 
-# -------------------------
-# CFM loss: linear path flow matching
-# -------------------------
 def cfm_loss(params, model_apply_fn, graph, x1, mask, rng_key, training: bool, target_dim: int = 3):
-    """
-    x1: true targets (batch_nodes, target_dim)
-    mask: (batch_nodes,) 1 for real nodes
-    """
+
     deterministic = not training
     rng_key, t_key, x0_key, dropout_key = jax.random.split(rng_key, 4)
 
-    # sample t per-node (simple + works well for node-wise data)
+    ### Sample time
     t = jax.random.uniform(t_key, shape=(x1.shape[0], 1), minval=0.0, maxval=1.0)
 
-    # base noise
+    ### Noise
     x0 = jax.random.normal(x0_key, shape=x1.shape, dtype=x1.dtype)
 
-    # linear interpolation
+    ### Optimal transport conditional flow
     x_t = (1.0 - t) * x0 + t * x1
 
-    # target velocity field along this path is constant
+    ### Target velocity field
     u_t = x1 - x0
 
     kwargs = dict(deterministic=deterministic)
     if not deterministic:
         kwargs["rngs"] = {"dropout": dropout_key}
 
-    v_pred = model_apply_fn({"params": params}, graph, x_t, t, **kwargs)  # (batch_nodes, target_dim)
+    v_pred = model_apply_fn({"params": params}, graph, x_t, t, **kwargs)
 
-    # masked MSE
+    ### CFM objective
     mask_f = mask.astype(v_pred.dtype).reshape(-1)
     count = mask_f.sum() + 1e-12
     mse_per_node = jnp.sum((v_pred - u_t) ** 2, axis=-1)
@@ -197,19 +188,12 @@ def eval_step(state, graph, targets, mask, rng_key, target_dim: int = 3):
     return cfm_loss(state.params, state.apply_fn, graph, targets, mask, rng_key, training=False, target_dim=target_dim)
 
 
-# -------------------------
-# Sampling (ODE integration)
-# -------------------------
 @functools.partial(jax.jit, static_argnames=("apply_fn",))
 def euler_step(params, apply_fn, graph, x, t, dt):
-    """
-    params: pytree
-    apply_fn: model.apply (STATIC)
-    x: (batch_nodes, target_dim)
-    t: scalar float
-    """
+
     t_vec = jnp.full((x.shape[0], 1), t, dtype=x.dtype)
     v = apply_fn({"params": params}, graph, x, t_vec, deterministic=True)
+
     return x + dt * v
 
 
@@ -221,15 +205,12 @@ def sample_cfm(
     num_steps: int = 64,
     target_dim: int = 3,
 ):
-    """
-    Solve dx/dt = v_theta(x,t|cond) from t=0 -> 1 with Euler steps.
-    Returns samples in standardized target space.
-    """
+
     n_total = graph.nodes.shape[0]
     x = jax.random.normal(rng_key, (n_total, target_dim), dtype=jnp.float32)
 
     ts = jnp.linspace(0.0, 1.0, num_steps + 1)
-    dt = ts[1] - ts[0]  # keep as JAX scalar
+    dt = ts[1] - ts[0]
 
     for k in range(num_steps):
         x = euler_step(params, apply_fn, graph, x, ts[k], dt)
@@ -304,7 +285,6 @@ def train_model(
         rng_key, step_key = jax.random.split(rng_key)
         state = train_step(state, graph, tgt, mask, step_key, target_dim=target_dim)
 
-        # log train loss on-the-fly (with a fresh rng)
         rng_key, log_key = jax.random.split(rng_key)
         batch_loss = eval_step(state, graph, tgt, mask, log_key, target_dim=target_dim)
         batch_loss.block_until_ready()
