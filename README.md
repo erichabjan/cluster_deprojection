@@ -1,21 +1,5 @@
-The Graph Neural Networks (GNNs) developed in this repository are trained using the [BAHAMAS simulation](https://arxiv.org/abs/1603.02702) and are evaluated on the [TNG simulation](https://www.tng-project.org/data/). The code in the `deterministic_model` trains a GNN using a standard, point estimation architecture while the `probabilistic_model` folder trains a model using conditional flow matching (CFM). The models take the ($x$, $y$, $v_z$) coordinates of cluster-member galaxies and outputs the ($z$, $v_x$, $v_y$) for all cluster-member galaxies. The training and validation curves of the current point estimatint model are shown here: 
+The machine learning models developed in this repository are trained using the [BAHAMAS simulation](https://arxiv.org/abs/1603.02702) and are evaluated on the [TNG simulation](https://www.tng-project.org/data/). The aim of this project is to reconstruct the ($z$, $v_x$, $v_y$) coordinates of cluster-member galaxies. 
 
-<p align="center">
-  <img src="/figures/loss_curves.png" alt="loss_curves" width="75%" />
-</p>
+The code in the `deterministic_model` trains a GNN using a point-estimation architecture, the `probabilistic_model` folder trains a GNN using conditional flow matching (CFM), and the `cnn_mlp_model` folder trains a model that combines a convolutional neural network (CNN) and multi-layer perceptron (MLP). The GNN models take the ($x$, $y$, $v_z$) coordinates of cluster-member galaxies and outputs the ($z$, $v_x$, $v_y$) for all cluster-member galaxies, while the CNN-MLP model uses image data of the entire cluster in order to predict the ($z$, $v_x$, $v_y$) coordinates of a single cluster.
 
-And the ability of this point estimating model to reconstruct the ($z$, $v_x$, $v_y$) coordiantes of single TNG cluster:
-
-<p align="center">
-  <img src="/figures/tng_predictions.png" alt="tng_predictions" width="75%" />
-</p>
-
-For the CFM model, we are able to obtain a posterior distribution for each reconstructed coordinates ($z$, $v_x$, $v_y$). Since it is expected that there are major degeneracies in the possible values of these unobserved coordinates, it is viatal that we quantify this degeneracy; in this case, a CFM allows for this degeneracy to be quantified with a PDF. Here we show the sampled posterior of the CFM for a simulated cluster from BAHAMAS:
-
-<p align="center">
-  <img src="/figures/cfm_predictions_z.png" width="25%" />
-  <img src="/figures/cfm_predictions_vx.png" width="25%" />
-  <img src="/figures/cfm_predictions_vy.png" width="25%" />
-</p>
-
-The reconstruction of these quantities will allow for the dynamical state of the clsuter to be probed and for projection effects to be better accounted for in both dynamical and weak lensing derived masses.
+The models in this repository are still a work in progress. The reconstruction of these quantities will allow for the dynamical state of the clsuter to be robustly probed, 6D dynamical substructure identification to be carried out and for projection effects to be better accounted for in both dynamical and weak lensing derived masses.

@@ -15,8 +15,8 @@ import jax.numpy as jnp
 import jax.nn as jnn
 
 ### Set data directory, batch size, and maximum number of nodes (galaxies)
-test_path = '/projects/mccleary_group/habjan.e/TNG/Data/GNN_SBI_data/GNN_data_test.h5'
-train_path = '/projects/mccleary_group/habjan.e/TNG/Data/GNN_SBI_data/GNN_data_train.h5'
+test_path = '/projects/mccleary_group/habjan.e/TNG/Data/GNN_SBI_data/GNN_data_test_norm.h5'
+train_path = '/projects/mccleary_group/habjan.e/TNG/Data/GNN_SBI_data/GNN_data_train_norm.h5'
 
 BATCH_SIZE = 1               
 MAX_NODES  = 700
@@ -199,10 +199,9 @@ for cluster_idx in cluster_inds:
         bright_bool = data['sub_massTotal'][:, 4] != 0
 
         # Positons + periodic boundary conditions
-        L = np.max(data['sub_pos'][bright_bool,:])
-        halfbox = L / 2
-        difpos = np.subtract(data['sub_pos'][bright_bool,:], data['CoP'])
-        coordinates = np.where( abs(difpos) > halfbox, abs(difpos)- L , difpos)
+        boxsize = 400
+        difpos = np.subtract(data['sub_pos'][bright_bool], data['CoP'])
+        coordinates = (difpos + 0.5 * boxsize) % boxsize - 0.5 * boxsize
 
         # c Mpc / h 
         eps = 10**-9
@@ -244,12 +243,19 @@ for cluster_idx in cluster_inds:
 
             r_ro_zscore, v_ro_zscore = (r_ro - r_ro_mean) / r_ro_std, (v_ro - v_ro_mean) / v_ro_std
 
+            ### Absolute value of z
+            z_abs = np.abs(ro_pos[:, 2])
+            z_abs_mean, z_abs_std = 1.25, 1.25
+            z_abs_zscore = (z_abs - z_abs_mean) / z_abs_std
+
             # (x, y, v_z)
             inputs  = np.stack((x_ro_pos, y_ro_pos, z_ro_vel),  axis=-1)
 
             # (z, v_x, v_y)
-            #targets = np.stack((r_ro_zscore, v_ro_zscore),  axis=-1)
-            targets = np.stack((z_ro_pos, x_ro_vel, y_ro_vel),  axis=-1)
+            targets = np.stack((r_ro_zscore, v_ro_zscore),  axis=-1)
+            #targets = np.stack((z_ro_pos, x_ro_vel, y_ro_vel),  axis=-1)
+            #targets = np.expand_dims(z_abs_zscore, axis=-1)
+            #targets = np.expand_dims(z_ro_pos, axis=-1)
 
             g = make_graph(inputs)
             padded_graph, node_mask = pad_batch([g], MAX_NODES, MAX_EDGES)

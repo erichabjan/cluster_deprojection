@@ -16,12 +16,12 @@ from training_structure import train_model, data_loader, create_train_state, tra
 from gnn import GraphConvNet
 
 ### Add a suffix for a new model
-suffix = '_testing_grad_clip'
+suffix = '_testing_zabs'
 
 ### Import data and create data loaders
 data_path = "/projects/mccleary_group/habjan.e/TNG/Data/GNN_SBI_data/"
-train_file = 'GNN_data_train.h5'
-test_file = 'GNN_data_test.h5'
+train_file = 'GNN_data_train_zabs.h5'
+test_file = 'GNN_data_test_zabs.h5'
 
 ### Train model
 if __name__ == "__main__":
@@ -45,29 +45,29 @@ if __name__ == "__main__":
                          attention = True,
                          shared_weights = True,
                          relative_updates = False,
-                         output_dim = 3,
+                         output_dim = 1,
                          dropout_rate = 0.0)
 
 
     ### Training parameters
     batch_size = 4
 
-    early_stopping = False
+    early_stopping = True
     patience = 200
     num_train_steps = 50_000
     eval_every = 25
     log_every = 50
     num_eval_batches = 250
 
-    learning_rate = optax.cosine_decay_schedule(init_value=1e-3,decay_steps=int(num_train_steps * 0.9), alpha=0.1)
-    gradient_clipping = 100
+    learning_rate = 3*10**-4 #optax.cosine_decay_schedule(init_value=1e-3,decay_steps=int(num_train_steps * 0.9), alpha=0.1)
+    gradient_clipping = 10
 
     ### Weights and Biases Notes
     wandb_notes = (
-        "Learning rate decay run. "
+        "Absolute value of z dataset. "
         f"hidden_size={hidden_size}, num_mlp_layers={num_mlp_layers}. "
         f"learning_rate={learning_rate}. gradient_clipping = {gradient_clipping}"
-        "Same as baseline run, except shared_weights = True, no early stopping, 3D"
+        "Same as baseline run, except shared_weights = True, with early stopping"
     )
 
     trained_state, model, train_losses, test_losses = train_model(
