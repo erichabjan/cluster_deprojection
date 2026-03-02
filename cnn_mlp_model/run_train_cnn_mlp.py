@@ -25,32 +25,33 @@ def main():
 
     cfg = ModelConfig(
         smoother_kernel=5,
-
         fmap_channels=(32, 64, 128),
         fmap_blocks_per_stage=2,
         cnn_dropout=0.0,
-
+        sampler_window=5,
+        global_dim=128,
+        global_use_std=True,
         mlp_hidden=(128, 128),
         head_hidden=(256, 256),
         dropout=0.0,
-
         output_dim=1,
-    )
+        )
+
     model = CNNMLPModel(cfg=cfg)
 
     batch_size = 16
-    num_train_steps = 50_000
+    num_train_steps = 250_000
     eval_every = 250
     log_every = 50
     num_eval_batches = 250
 
-    lr = optax.cosine_decay_schedule(init_value=1e-3, decay_steps=int(num_train_steps * 0.9), alpha=0.1,)
+    lr = optax.cosine_decay_schedule(init_value=1e-4, decay_steps=int(num_train_steps * 0.9), alpha=0.1,)
     grad_clip = 10.0
 
-    suffix = "_cnnmlp_sampler_v1"
+    suffix = "_global_test"
 
     wandb_notes = (
-        "Residual feature-map encoder + bilinear sampler. "
+        "Added concatenation from feature map with global features."
         "Model inputs: images (mass_xy, gal_xy, gal_vz_xy), gal_features=(x,y,vz,Ngal), "
         "gal_pixel_coords=(x_pix,y_pix). "
         "Sampler extracts local CNN features at each galaxy position, concatenated with MLP branch."

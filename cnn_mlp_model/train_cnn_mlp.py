@@ -10,6 +10,7 @@ import optax
 from flax.training import train_state
 
 import wandb
+from cnn_mlp_model import CNNMLPModel, ModelConfig
 
 
 def preload_hdf5_to_memory(file_path: str) -> Dict[str, np.ndarray]:

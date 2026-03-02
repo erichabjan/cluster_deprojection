@@ -24,34 +24,47 @@ class MLP(nn.Module):
 
 class DiscreteMapSmoother(nn.Module):
     """
-    Channel-wise learnable smoothing on image inputs.
-    Expects channels-last images: (B, H, W, C)
+    Only smooth discrete channels, identity-initialized.
+    Expects channels-last images: (B, H, W, C).
     """
     kernel_size: int = 5
+    discrete_channel_indices: Sequence[int] = (1, 2)
+
+    @staticmethod
+    def _identity_kernel_init(kernel_size: int):
+        def init(key, shape, dtype=jnp.float32):
+            kh, kw, in_ch, out_ch = shape
+            k = jnp.zeros(shape, dtype=dtype)
+            cy = kh // 2
+            cx = kw // 2
+            k = k.at[cy, cx, 0, 0].set(1.0)
+            return k
+        return init
 
     @nn.compact
     def __call__(self, x):
         B, H, W, C = x.shape
-        outs = []
-        for c in range(C):
+        k = self.kernel_size
+        if k % 2 != 1:
+            raise ValueError("kernel_size should be odd for identity init.")
+
+        outs = [x[..., i:i+1] for i in range(C)]
+        for c in self.discrete_channel_indices:
             xc = x[..., c:c+1]
             yc = nn.Conv(
                 features=1,
-                kernel_size=(self.kernel_size, self.kernel_size),
+                kernel_size=(k, k),
                 padding="SAME",
                 use_bias=True,
-                kernel_init=nn.initializers.normal(stddev=0.02),
+                kernel_init=self._identity_kernel_init(k),
                 bias_init=nn.initializers.zeros,
-                name=f"smooth_conv_c{c}",
+                name=f"smooth_identity_c{c}",
             )(xc)
-            outs.append(yc)
+            outs[c] = yc
         return jnp.concatenate(outs, axis=-1)
 
 
 class ResidualBlock(nn.Module):
-    """
-    Same-resolution residual block.
-    """
     channels: int
     dropout_rate: float = 0.0
     activation: Callable = nn.gelu
@@ -77,10 +90,6 @@ class ResidualBlock(nn.Module):
 
 
 class ResidualFeatureMapEncoder(nn.Module):
-    """
-    CNN encoder that preserves spatial resolution and returns a feature map.
-    No pooling / no striding.
-    """
     channels: Sequence[int] = (32, 64, 128)
     blocks_per_stage: int = 2
     dropout_rate: float = 0.0
@@ -88,10 +97,6 @@ class ResidualFeatureMapEncoder(nn.Module):
 
     @nn.compact
     def __call__(self, x, deterministic: bool):
-        """
-        x: (B, H, W, C_in)
-        returns: (B, H, W, C_out)
-        """
         x = nn.Conv(self.channels[0], kernel_size=(3, 3), padding="SAME")(x)
         x = self.activation(x)
 
@@ -103,60 +108,38 @@ class ResidualFeatureMapEncoder(nn.Module):
                     activation=self.activation,
                     name=f"res_stage{si}_block{bi}",
                 )(x, deterministic=deterministic)
-
         return x
 
 
 def bilinear_sample_feature_map(feature_map: jnp.ndarray, pixel_coords: jnp.ndarray) -> jnp.ndarray:
-    """
-    Bilinear sampler for per-galaxy feature queries.
-
-    Args:
-        feature_map: (B, H, W, C)
-        pixel_coords: (B, N, 2) continuous coords in image pixel space
-                     [..., 0] = x_pix in [0, W-1]
-                     [..., 1] = y_pix in [0, H-1]
-
-    Returns:
-        sampled: (B, N, C)
-    """
     B, H, W, C = feature_map.shape
     _, N, two = pixel_coords.shape
-    assert two == 2, f"pixel_coords must have shape (B, N, 2), got {pixel_coords.shape}"
+    assert two == 2
 
-    x = pixel_coords[..., 0]
-    y = pixel_coords[..., 1]
-
-    # Clamp to valid range
-    x = jnp.clip(x, 0.0, W - 1.0)
-    y = jnp.clip(y, 0.0, H - 1.0)
+    x = jnp.clip(pixel_coords[..., 0], 0.0, W - 1.0)
+    y = jnp.clip(pixel_coords[..., 1], 0.0, H - 1.0)
 
     x0 = jnp.floor(x).astype(jnp.int32)
     y0 = jnp.floor(y).astype(jnp.int32)
     x1 = jnp.clip(x0 + 1, 0, W - 1)
     y1 = jnp.clip(y0 + 1, 0, H - 1)
 
-    # Fractional part
     wx = x - x0.astype(x.dtype)
     wy = y - y0.astype(y.dtype)
 
-    # Bilinear weights
     w00 = (1.0 - wx) * (1.0 - wy)
     w01 = (1.0 - wx) * wy
     w10 = wx * (1.0 - wy)
     w11 = wx * wy
 
-    # Batch indices for gather
     b_idx = jnp.arange(B, dtype=jnp.int32)[:, None]
     b_idx = jnp.broadcast_to(b_idx, (B, N))
 
-    # Gather corner features: each -> (B, N, C)
     f00 = feature_map[b_idx, y0, x0]
     f01 = feature_map[b_idx, y1, x0]
     f10 = feature_map[b_idx, y0, x1]
     f11 = feature_map[b_idx, y1, x1]
 
-    # Weighted sum (expand weights to feature dim)
     sampled = (
         w00[..., None] * f00
         + w01[..., None] * f01
@@ -166,78 +149,107 @@ def bilinear_sample_feature_map(feature_map: jnp.ndarray, pixel_coords: jnp.ndar
     return sampled
 
 
+def bilinear_sample_feature_map_window(feature_map: jnp.ndarray, pixel_coords: jnp.ndarray, window_size: int) -> jnp.ndarray:
+    if window_size % 2 != 1 or window_size < 1:
+        raise ValueError(f"window_size must be an odd positive int, got {window_size}")
+
+    B, H, W, C = feature_map.shape
+    _, N, _ = pixel_coords.shape
+
+    r = window_size // 2
+    dx = jnp.arange(-r, r + 1, dtype=pixel_coords.dtype)
+    dy = jnp.arange(-r, r + 1, dtype=pixel_coords.dtype)
+    off_y, off_x = jnp.meshgrid(dy, dx, indexing="ij")
+    offsets = jnp.stack([off_x.reshape(-1), off_y.reshape(-1)], axis=-1)  # (P,2)
+    P = offsets.shape[0]
+
+    coords = pixel_coords[:, :, None, :] + offsets[None, None, :, :]      # (B,N,P,2)
+    coords = coords.reshape(B, N * P, 2)                                  # (B,N*P,2)
+
+    sampled = bilinear_sample_feature_map(feature_map, coords)            # (B,N*P,C)
+    sampled = sampled.reshape(B, N, P * C)                                # (B,N,P*C)
+    return sampled
+
+
 @dataclass
 class ModelConfig:
     smoother_kernel: int = 5
 
-    # New residual feature-map encoder config
     fmap_channels: Sequence[int] = (32, 64, 128)
     fmap_blocks_per_stage: int = 2
     cnn_dropout: float = 0.0
 
-    # MLP branches
+    sampler_window: int = 5  # 5x5
+
+    # NEW: global context
+    global_dim: int = 128
+    global_use_std: bool = True  # mean+max (+std)
+
     mlp_hidden: Sequence[int] = (128, 128)
     head_hidden: Sequence[int] = (256, 256)
     dropout: float = 0.0
-    output_dim: int = 3
+    output_dim: int = 1
 
 
 class CNNMLPModel(nn.Module):
-    """
-    Model with:
-      - CNN residual feature-map encoder (spatially preserved)
-      - bilinear sampler using per-galaxy pixel coords
-      - per-galaxy MLP branch
-      - fusion head MLP
-
-    Expected inputs:
-      images:           (B, H, W, C)  [channels-last]
-      mlp_in:           (B, N, Fm)    e.g. Fm=4
-      gal_pixel_coords: (B, N, 2)     [x_pix, y_pix] in image pixel coordinates
-    """
     cfg: ModelConfig
 
-    @nn.compact
+    def setup(self):
+        self.smoother = DiscreteMapSmoother(
+            kernel_size=self.cfg.smoother_kernel,
+            discrete_channel_indices=(1, 2),
+        )
+        self.encoder = ResidualFeatureMapEncoder(
+            channels=self.cfg.fmap_channels,
+            blocks_per_stage=self.cfg.fmap_blocks_per_stage,
+            dropout_rate=self.cfg.cnn_dropout,
+        )
+        self.global_proj = nn.Dense(self.cfg.global_dim)
+
+        self.query_mlp = MLP(
+            [*self.cfg.mlp_hidden, self.cfg.mlp_hidden[-1]],
+            dropout_rate=self.cfg.dropout,
+        )
+        self.head_mlp = MLP(
+            [*self.cfg.head_hidden, self.cfg.output_dim],
+            dropout_rate=self.cfg.dropout,
+        )
+
+    def _global_context(self, fmap: jnp.ndarray, N: int) -> jnp.ndarray:
+        """
+        fmap: (B,H,W,Cf) -> returns (B,N,global_dim)
+        """
+        g_mean = jnp.mean(fmap, axis=(1, 2))  # (B,Cf)
+        g_max = jnp.max(fmap, axis=(1, 2))    # (B,Cf)
+
+        if self.cfg.global_use_std:
+            # variance over spatial dims
+            mu = g_mean[:, None, None, :]
+            g_std = jnp.sqrt(jnp.mean((fmap - mu) ** 2, axis=(1, 2)) + 1e-6)  # (B,Cf)
+            g = jnp.concatenate([g_mean, g_max, g_std], axis=-1)              # (B,3Cf)
+        else:
+            g = jnp.concatenate([g_mean, g_max], axis=-1)                     # (B,2Cf)
+
+        g = self.global_proj(g)  # (B,global_dim)
+        g = g[:, None, :]        # (B,1,global_dim)
+        g = jnp.broadcast_to(g, (g.shape[0], N, g.shape[-1]))  # (B,N,global_dim)
+        return g
+
     def __call__(self, images, mlp_in, gal_pixel_coords, deterministic: bool):
-        """
-        Args:
-            images: (B, H, W, C)  -- if your dataloader gives (B, C, H, W), transpose before calling
-            mlp_in: (B, N, 4)
-            gal_pixel_coords: (B, N, 2), columns=[x_pix, y_pix]
-            deterministic: bool
+        # images: (B,H,W,C), mlp_in: (B,N,F), gal_pixel_coords: (B,N,2)
+        B, N, _ = mlp_in.shape
 
-        Returns:
-            out: (B, N, output_dim)
-        """
-        # --- Input sanity ---
-        if images.ndim != 4:
-            raise ValueError(f"images must be rank-4 (B,H,W,C), got shape {images.shape}")
-        if mlp_in.ndim != 3:
-            raise ValueError(f"mlp_in must be rank-3 (B,N,F), got shape {mlp_in.shape}")
-        if gal_pixel_coords.ndim != 3 or gal_pixel_coords.shape[-1] != 2:
-            raise ValueError(
-                f"gal_pixel_coords must have shape (B,N,2), got {gal_pixel_coords.shape}"
-            )
+        smoothed = self.smoother(images)
+        fmap = self.encoder(smoothed, deterministic=deterministic)  # (B,H,W,Cf)
 
-        B_img = images.shape[0]
-        B_mlp, N, _ = mlp_in.shape
-        B_pix, N_pix, _ = gal_pixel_coords.shape
-        if not (B_img == B_mlp == B_pix):
-            raise ValueError(f"Batch mismatch: images={B_img}, mlp_in={B_mlp}, pixel_coords={B_pix}")
-        if N != N_pix:
-            raise ValueError(f"Galaxy count mismatch: mlp_in N={N}, pixel_coords N={N_pix}")
+        sampled_feat = bilinear_sample_feature_map_window(
+            fmap, gal_pixel_coords, window_size=self.cfg.sampler_window
+        )  # (B,N,(ws^2)*Cf)
 
-        smoothed_images = DiscreteMapSmoother(kernel_size=self.cfg.smoother_kernel)(images)
+        q = self.query_mlp(mlp_in, deterministic=deterministic)  # (B,N,Dq)
 
-        feature_map = ResidualFeatureMapEncoder(channels=self.cfg.fmap_channels, blocks_per_stage=self.cfg.fmap_blocks_per_stage,
-                                                dropout_rate=self.cfg.cnn_dropout,)(smoothed_images, deterministic=deterministic)
+        g = self._global_context(fmap, N=N)  # (B,N,global_dim)
 
-        sampled_feat = bilinear_sample_feature_map(feature_map, gal_pixel_coords)
-
-        q = MLP([*self.cfg.mlp_hidden, self.cfg.mlp_hidden[-1]], dropout_rate=self.cfg.dropout,)(mlp_in, deterministic=deterministic)
-
-        fused = jnp.concatenate([sampled_feat, q], axis=-1)
-
-        out = MLP([*self.cfg.head_hidden, self.cfg.output_dim], dropout_rate=self.cfg.dropout,)(fused, deterministic=deterministic)
-
+        fused = jnp.concatenate([sampled_feat, q, g], axis=-1)
+        out = self.head_mlp(fused, deterministic=deterministic)  # (B,N,output_dim)
         return out
