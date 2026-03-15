@@ -5,31 +5,22 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
-# ------------------------------------------------------------
-# Imports from your codebase
-# ------------------------------------------------------------
 sys.path.append(os.getcwd())
 
 from conditional_diffusion_3d_model import ConditionalUNet3D, DiffusionModelConfig
 from train_conditional_diffusion import preload_hdf5_to_memory, sample_ddpm
 
 
-# ------------------------------------------------------------
-# Paths
-# ------------------------------------------------------------
 val_path = "/projects/mccleary_group/habjan.e/TNG/Data/conditional_diffusion_data/cond_diffusion_test.h5"
 
 model_dir = os.path.join(os.getcwd(), "conditional_diffusion_models")
-param_path = os.path.join(model_dir, "cond_diffusion_params_64cube_v1.pkl")
-sched_path = os.path.join(model_dir, "cond_diffusion_schedule_64cube_v1.pkl")
+param_path = os.path.join(model_dir, "cond_diffusion_params_64cube_v2.pkl")
+sched_path = os.path.join(model_dir, "cond_diffusion_schedule_64cube_v2.pkl")
 
 out_dir = "/projects/mccleary_group/habjan.e/TNG/Data/conditional_diffusion_data/cd_samples"
 os.makedirs(out_dir, exist_ok=True)
 
 
-# ------------------------------------------------------------
-# Load validation data
-# ------------------------------------------------------------
 data_dict = preload_hdf5_to_memory(val_path)
 
 images_all = data_dict["images"]   # (N, C, H, W)
@@ -46,9 +37,6 @@ imgs_hwc = np.transpose(imgs, (1, 2, 0))       # (H, W, C)
 true_cube = cubes_all[test_idx]                # (Z, Y, X)
 
 
-# ------------------------------------------------------------
-# Load model + diffusion schedule
-# ------------------------------------------------------------
 with open(param_path, "rb") as f:
     params = pickle.load(f)
 
@@ -63,16 +51,12 @@ cfg = DiffusionModelConfig(
     base_channels=32,
     channel_mults=(1, 2, 4),
     time_emb_dim=128,
-    cond_emb_dim=128,
     out_channels=1,
 )
 
 model = ConditionalUNet3D(cfg=cfg)
 
 
-# ------------------------------------------------------------
-# Sampling helper
-# ------------------------------------------------------------
 def generate_cube_samples(model, params, cond_image_hwc, seeds, cube_shape_zyx):
     """
     cond_image_hwc: (H, W, C)
@@ -107,10 +91,7 @@ def generate_cube_samples(model, params, cond_image_hwc, seeds, cube_shape_zyx):
     return np.stack(samples, axis=0)   # (Nseed,Z,Y,X)
 
 
-# ------------------------------------------------------------
-# Generate samples from different seeds
-# ------------------------------------------------------------
-seeds = np.array([0, 1, 2, 3], dtype=np.int32)
+seeds = np.arange(0, 100, dtype=np.int32)
 
 sampled_cubes = generate_cube_samples(
     model=model,
@@ -121,9 +102,6 @@ sampled_cubes = generate_cube_samples(
 )
 
 
-# ------------------------------------------------------------
-# Save output
-# ------------------------------------------------------------
 save_path = os.path.join(out_dir, f"sampled_cubes_validx_{test_idx:04d}.npz")
 
 np.savez_compressed(

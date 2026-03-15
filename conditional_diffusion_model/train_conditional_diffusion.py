@@ -11,10 +11,6 @@ from flax.training import train_state
 import wandb
 
 
-# ============================================================
-# HDF5 loading
-# ============================================================
-
 def preload_hdf5_to_memory(file_path: str) -> Dict[str, np.ndarray]:
     print(f"\nPreloading {file_path} into memory...")
     start = time.time()
@@ -67,11 +63,6 @@ def preload_hdf5_to_memory(file_path: str) -> Dict[str, np.ndarray]:
         metadata=metadata,
     )
 
-
-# ============================================================
-# Data loader
-# ============================================================
-
 def data_loader(
     data: Dict[str, np.ndarray],
     batch_size: int,
@@ -102,10 +93,6 @@ def infinite_data_loader(data, batch_size, rng, shuffle=True):
         yield from data_loader(data, batch_size=batch_size, rng=rng, shuffle=shuffle)
 
 
-# ============================================================
-# DDPM schedule
-# ============================================================
-
 def make_beta_schedule(T: int, beta_start: float = 1e-4, beta_end: float = 2e-2):
     betas = jnp.linspace(beta_start, beta_end, T, dtype=jnp.float32)
     alphas = 1.0 - betas
@@ -114,20 +101,11 @@ def make_beta_schedule(T: int, beta_start: float = 1e-4, beta_end: float = 2e-2)
 
 
 def q_sample(x0, t, noise, alpha_bars):
-    """
-    x0: (B,...)
-    t: (B,) int
-    noise: same shape as x0
-    """
     a_bar = alpha_bars[t]  # (B,)
     while a_bar.ndim < x0.ndim:
         a_bar = a_bar[..., None]
     return jnp.sqrt(a_bar) * x0 + jnp.sqrt(1.0 - a_bar) * noise
 
-
-# ============================================================
-# Train state
-# ============================================================
 
 def create_train_state(model, rng_key, learning_rate, grad_clipping, example_batch):
     images_ex, cubes_ex = example_batch
@@ -148,10 +126,6 @@ def create_train_state(model, rng_key, learning_rate, grad_clipping, example_bat
     return train_state.TrainState.create(apply_fn=model.apply, params=params, tx=tx)
 
 
-# ============================================================
-# Loss
-# ============================================================
-
 def diffusion_loss(params, apply_fn, images, cubes, timesteps, noise, alpha_bars):
     noisy = q_sample(cubes, timesteps, noise, alpha_bars)
     pred_noise = apply_fn(
@@ -162,10 +136,6 @@ def diffusion_loss(params, apply_fn, images, cubes, timesteps, noise, alpha_bars
     )
     return jnp.mean((pred_noise - noise) ** 2)
 
-
-# ============================================================
-# JIT steps
-# ============================================================
 
 @jax.jit
 def train_step(state, images, cubes, rng_key, alpha_bars, num_timesteps):
@@ -198,10 +168,6 @@ def eval_step(state, images, cubes, rng_key, alpha_bars, num_timesteps):
         images, cubes, t, noise, alpha_bars
     )
 
-
-# ============================================================
-# Sampling
-# ============================================================
 
 def sample_ddpm(model_apply, params, cond_images, sample_shape, rng_key, betas, alphas, alpha_bars):
     """
@@ -240,10 +206,6 @@ def sample_ddpm(model_apply, params, cond_images, sample_shape, rng_key, betas, 
 
     return x
 
-
-# ============================================================
-# Training loop
-# ============================================================
 
 def train_model(
     train_data: Dict[str, np.ndarray],

@@ -25,7 +25,6 @@ def main():
         base_channels=32,
         channel_mults=(1, 2, 4),
         time_emb_dim=128,
-        cond_emb_dim=128,
         out_channels=1,
     )
 
@@ -48,7 +47,7 @@ def main():
     beta_start = 1e-4
     beta_end = 2e-2
 
-    suffix = "_64cube_v1"
+    suffix = "_64cube_v2"
 
     wandb_notes = (
         "Conditional 3D diffusion model. "
@@ -62,7 +61,6 @@ def main():
         base_channels=int(cfg.base_channels),
         channel_mults=str(cfg.channel_mults),
         time_emb_dim=int(cfg.time_emb_dim),
-        cond_emb_dim=int(cfg.cond_emb_dim),
         out_channels=int(cfg.out_channels),
         image_storage="(S,C,H,W) in HDF5; transposed to (B,H,W,C) in loader",
         cube_storage="(S,Z,Y,X) in HDF5; expanded to (B,Z,Y,X,1) in loader",

@@ -35,14 +35,15 @@ class MLP(nn.Module):
 
 class ResBlock3D(nn.Module):
     out_ch: int
-    cond_dim: int
+    time_dim: int
     activation: Callable = nn.gelu
 
     @nn.compact
-    def __call__(self, x, cond_vec):
+    def __call__(self, x, time_emb, film_xy):
         """
-        x: (B, Z, Y, X, C)
-        cond_vec: (B, cond_dim)
+        x:       (B, Z, Y, X, C_in)
+        time_emb:(B, time_dim)
+        film_xy: (B, Y, X, C_film)
         """
         in_ch = x.shape[-1]
         residual = x
@@ -50,13 +51,23 @@ class ResBlock3D(nn.Module):
         h = nn.Conv(self.out_ch, kernel_size=(3, 3, 3), padding="SAME")(x)
         h = nn.GroupNorm(num_groups=min(8, self.out_ch))(h)
 
-        cond = nn.Dense(2 * self.out_ch)(cond_vec)  # (B, 2C)
-        scale, shift = jnp.split(cond, 2, axis=-1)
-        scale = scale[:, None, None, None, :]
-        shift = shift[:, None, None, None, :]
-        h = h * (1.0 + scale) + shift
+        # Global time conditioning
+        t_cond = nn.Dense(2 * self.out_ch)(time_emb)
+        t_scale, t_shift = jnp.split(t_cond, 2, axis=-1)
+        t_scale = t_scale[:, None, None, None, :]
+        t_shift = t_shift[:, None, None, None, :]
 
+        # Spatial FiLM conditioning from XY maps
+        xy_cond = nn.Conv(2 * self.out_ch, kernel_size=(3, 3), padding="SAME")(film_xy)
+        xy_scale, xy_shift = jnp.split(xy_cond, 2, axis=-1)
+
+        # Broadcast along z-axis
+        xy_scale = xy_scale[:, None, :, :, :]
+        xy_shift = xy_shift[:, None, :, :, :]
+
+        h = h * (1.0 + t_scale + xy_scale) + (t_shift + xy_shift)
         h = self.activation(h)
+
         h = nn.Conv(self.out_ch, kernel_size=(3, 3, 3), padding="SAME")(h)
         h = nn.GroupNorm(num_groups=min(8, self.out_ch))(h)
         h = self.activation(h)
@@ -93,25 +104,27 @@ class Upsample3D(nn.Module):
 
 class Conditioning2DEncoder(nn.Module):
     channels: Sequence[int] = (32, 64, 128)
-    emb_dim: int = 128
     activation: Callable = nn.gelu
 
     @nn.compact
     def __call__(self, images):
         """
-        images: (B,H,W,C)
+        images: (B, H, W, C)
+        returns multiscale feature maps preserving XY structure
         """
-        x = images
-        for ch in self.channels:
+        feats = []
+
+        x = nn.Conv(self.channels[0], kernel_size=(3, 3), padding="SAME")(images)
+        x = self.activation(x)
+        feats.append(x)
+
+        for ch in self.channels[1:]:
+            x = nn.avg_pool(x, window_shape=(2, 2), strides=(2, 2), padding="SAME")
             x = nn.Conv(ch, kernel_size=(3, 3), padding="SAME")(x)
             x = self.activation(x)
-            x = nn.avg_pool(x, window_shape=(2, 2), strides=(2, 2), padding="SAME")
+            feats.append(x)
 
-        x_mean = jnp.mean(x, axis=(1, 2))
-        x_max = jnp.max(x, axis=(1, 2))
-        x = jnp.concatenate([x_mean, x_max], axis=-1)
-        x = MLP([self.emb_dim, self.emb_dim])(x)
-        return x
+        return feats
 
 
 @dataclass
@@ -119,7 +132,6 @@ class DiffusionModelConfig:
     base_channels: int = 32
     channel_mults: Sequence[int] = (1, 2, 4)
     time_emb_dim: int = 128
-    cond_emb_dim: int = 128
     out_channels: int = 1
 
 
@@ -129,38 +141,37 @@ class ConditionalUNet3D(nn.Module):
     @nn.compact
     def __call__(self, noisy_cube, timesteps, cond_images):
         """
-        noisy_cube: (B,Z,Y,X,1)
+        noisy_cube: (B, Z, Y, X, 1)
         timesteps: (B,)
-        cond_images: (B,H,W,3)
-        returns predicted noise with same shape as noisy_cube
+        cond_images: (B, H, W, 3)
         """
         time_emb = sinusoidal_time_embedding(timesteps, self.cfg.time_emb_dim)
         time_emb = MLP([self.cfg.time_emb_dim, self.cfg.time_emb_dim])(time_emb)
 
-        cond_emb = Conditioning2DEncoder(
-            emb_dim=self.cfg.cond_emb_dim
-        )(cond_images)
-
-        cond_vec = jnp.concatenate([time_emb, cond_emb], axis=-1)
-
         chs = [self.cfg.base_channels * m for m in self.cfg.channel_mults]
+
+        cond_feats = Conditioning2DEncoder(
+            channels=chs
+        )(cond_images)
 
         x = nn.Conv(chs[0], kernel_size=(3, 3, 3), padding="SAME")(noisy_cube)
 
         skips = []
-        for ch in chs[:-1]:
-            x = ResBlock3D(ch, cond_dim=cond_vec.shape[-1])(x, cond_vec)
-            x = ResBlock3D(ch, cond_dim=cond_vec.shape[-1])(x, cond_vec)
+        for level, ch in enumerate(chs[:-1]):
+            film_xy = cond_feats[level]
+
+            x = ResBlock3D(ch, time_dim=self.cfg.time_emb_dim)(x, time_emb, film_xy)
+            x = ResBlock3D(ch, time_dim=self.cfg.time_emb_dim)(x, time_emb, film_xy)
             skips.append(x)
             x = Downsample3D(ch)(x)
 
-        x = ResBlock3D(chs[-1], cond_dim=cond_vec.shape[-1])(x, cond_vec)
-        x = ResBlock3D(chs[-1], cond_dim=cond_vec.shape[-1])(x, cond_vec)
+        bottleneck_film = cond_feats[-1]
+        x = ResBlock3D(chs[-1], time_dim=self.cfg.time_emb_dim)(x, time_emb, bottleneck_film)
+        x = ResBlock3D(chs[-1], time_dim=self.cfg.time_emb_dim)(x, time_emb, bottleneck_film)
 
-        for ch, skip in zip(reversed(chs[:-1]), reversed(skips)):
+        for level, (ch, skip) in enumerate(zip(reversed(chs[:-1]), reversed(skips))):
             x = Upsample3D(ch)(x)
 
-            # crop if needed due to odd shapes
             min_z = min(x.shape[1], skip.shape[1])
             min_y = min(x.shape[2], skip.shape[2])
             min_x = min(x.shape[3], skip.shape[3])
@@ -169,8 +180,11 @@ class ConditionalUNet3D(nn.Module):
             skip = skip[:, :min_z, :min_y, :min_x, :]
 
             x = jnp.concatenate([x, skip], axis=-1)
-            x = ResBlock3D(ch, cond_dim=cond_vec.shape[-1])(x, cond_vec)
-            x = ResBlock3D(ch, cond_dim=cond_vec.shape[-1])(x, cond_vec)
+
+            film_xy = cond_feats[len(chs[:-1]) - 1 - level]
+
+            x = ResBlock3D(ch, time_dim=self.cfg.time_emb_dim)(x, time_emb, film_xy)
+            x = ResBlock3D(ch, time_dim=self.cfg.time_emb_dim)(x, time_emb, film_xy)
 
         x = nn.GroupNorm(num_groups=min(8, x.shape[-1]))(x)
         x = nn.gelu(x)

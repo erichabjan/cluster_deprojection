@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=cond_diff_train
 #SBATCH --output=/home/habjan.e/TNG/Sandbox_notebooks/phase_space_recon/cond_diff_slurm_logs/cd_sampling_%j.log
-#SBATCH --time=1:00:00
-#SBATCH --mem=24G
+#SBATCH --time=8:00:00
+#SBATCH --mem=30G
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:a100:1
 #SBATCH --cpus-per-task=4
