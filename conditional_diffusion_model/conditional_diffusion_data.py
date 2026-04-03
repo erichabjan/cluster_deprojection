@@ -19,8 +19,8 @@ import TNG_DA
 @dataclass
 class GridConfig:
     fov_mpc: float = 5.0              # cube/image span is [-fov_mpc, +fov_mpc]
-    image_resolution: int = 64
-    cube_resolution: int = 64
+    image_resolution: int = 16
+    cube_resolution: int = 16
     vz_max_kms: float = 4000.0
     eps: float = 1e-12
     floor_value: float = -5.0         # value for empty / ultra-low voxels after normalization
@@ -95,7 +95,9 @@ def make_galaxy_map_xy(x: np.ndarray, y: np.ndarray, cfg: GridConfig) -> np.ndar
     return _bin2d_sum(x, y, w, xlim, ylim, H, W)
 
 
-def make_galaxy_vz_mean_xy(x: np.ndarray, y: np.ndarray, vz: np.ndarray, cfg: GridConfig) -> np.ndarray:
+def make_galaxy_vz_mean_xy(
+    x: np.ndarray, y: np.ndarray, vz: np.ndarray, cfg: GridConfig
+) -> np.ndarray:
     H = W = cfg.image_resolution
     xlim = (-cfg.fov_mpc, cfg.fov_mpc)
     ylim = (-cfg.fov_mpc, cfg.fov_mpc)
@@ -107,6 +109,39 @@ def make_galaxy_vz_mean_xy(x: np.ndarray, y: np.ndarray, vz: np.ndarray, cfg: Gr
     mask = count > 0
     mean_vz[mask] = vz_sum[mask] / count[mask]
     return mean_vz
+
+
+def make_galaxy_vz_disp_xy(
+    x: np.ndarray, y: np.ndarray, vz: np.ndarray, cfg: GridConfig
+) -> np.ndarray:
+    """
+    Per-pixel LOS velocity dispersion map in the XY plane.
+
+    Uses:
+        sigma_vz^2 = <vz^2> - <vz>^2
+
+    Empty pixels and 1-galaxy pixels are set to 0.
+    """
+    H = W = cfg.image_resolution
+    xlim = (-cfg.fov_mpc, cfg.fov_mpc)
+    ylim = (-cfg.fov_mpc, cfg.fov_mpc)
+
+    vz = vz.astype(np.float32)
+    vz_sum = _bin2d_sum(x, y, vz, xlim, ylim, H, W)
+    vz2_sum = _bin2d_sum(x, y, vz**2, xlim, ylim, H, W)
+    count = _bin2d_count(x, y, xlim, ylim, H, W)
+
+    disp_vz = np.zeros((H, W), dtype=np.float32)
+
+    # Require at least 2 galaxies in a pixel for a meaningful dispersion
+    mask = count > 1
+    if np.any(mask):
+        mean = vz_sum[mask] / count[mask]
+        mean2 = vz2_sum[mask] / count[mask]
+        var = np.maximum(mean2 - mean**2, 0.0)
+        disp_vz[mask] = np.sqrt(var).astype(np.float32)
+
+    return disp_vz
 
 
 def make_total_mass_map_xy(
@@ -183,7 +218,9 @@ def make_total_density_cube(
     return rho.astype(np.float32)
 
 
-def log_standardize_with_floor(x: np.ndarray, mean: float, std: float, floor_value: float, eps: float = 0.0) -> np.ndarray:
+def log_standardize_with_floor(
+    x: np.ndarray, mean: float, std: float, floor_value: float, eps: float = 0.0
+) -> np.ndarray:
     out = np.full_like(x, floor_value, dtype=np.float32)
     mask = x > eps
     if np.any(mask):
@@ -297,8 +334,12 @@ def build_one_sample(args) -> Dict[str, np.ndarray]:
     )
 
     gal_xy = make_galaxy_map_xy(x, y, grid_cfg)
+
     gal_vz_xy = make_galaxy_vz_mean_xy(x, y, vz, grid_cfg)
     gal_vz_xy = (gal_vz_xy - scaling_cfg.vel_mean) / scaling_cfg.vel_std
+
+    gal_vz_disp_xy = make_galaxy_vz_disp_xy(x, y, vz, grid_cfg)
+    gal_vz_disp_xy = gal_vz_disp_xy / scaling_cfg.vel_std
 
     # -------------------------------
     # 3D target cube
@@ -347,6 +388,7 @@ def build_one_sample(args) -> Dict[str, np.ndarray]:
         raw_density_cube=density_cube,
         gal_xy=gal_xy.astype(np.float32),
         gal_vz_xy=gal_vz_xy.astype(np.float32),
+        gal_vz_disp_xy=gal_vz_disp_xy.astype(np.float32),
 
         gal_features=feat_pad,
         gal_targets=targ_pad,
@@ -382,13 +424,25 @@ def write_sample_to_hdf5(
     grp.attrs["cluster_mass"] = float(sample["halo_mass"])
     grp.attrs["n_galaxies"] = int(sample["n_gal"])
 
-    mass_xy = log_standardize_with_floor(sample["raw_mass_xy"], mass_mean, mass_std, floor_value=floor_value)
-    cube = log_standardize_with_floor(sample["raw_density_cube"], cube_mean, cube_std, floor_value=floor_value)
+    mass_xy = log_standardize_with_floor(
+        sample["raw_mass_xy"], mass_mean, mass_std, floor_value=floor_value
+    )
+    cube = log_standardize_with_floor(
+        sample["raw_density_cube"], cube_mean, cube_std, floor_value=floor_value
+    )
 
-    images = np.stack([mass_xy, sample["gal_xy"], sample["gal_vz_xy"]], axis=0).astype(np.float32)
+    images = np.stack(
+        [
+            mass_xy,
+            sample["gal_xy"],
+            sample["gal_vz_xy"],
+            sample["gal_vz_disp_xy"],
+        ],
+        axis=0
+    ).astype(np.float32)
 
     grp.create_dataset("projection_vector", data=sample["proj_vec"])
-    grp.create_dataset("images", data=images, compression="gzip")               # (3,H,W)
+    grp.create_dataset("images", data=images, compression="gzip")               # (4,H,W)
     grp.create_dataset("density_cube", data=cube, compression="gzip")           # (Z,Y,X)
     grp.create_dataset("gal_features", data=sample["gal_features"], compression="gzip")
     grp.create_dataset("gal_targets", data=sample["gal_targets"], compression="gzip")
@@ -405,8 +459,8 @@ def main():
     out_dir = "/projects/mccleary_group/habjan.e/TNG/Data/conditional_diffusion_data/"
     os.makedirs(out_dir, exist_ok=True)
 
-    train_path = os.path.join(out_dir, "cond_diffusion_train.h5")
-    test_path = os.path.join(out_dir, "cond_diffusion_test.h5")
+    train_path = os.path.join(out_dir, "cond_diffusion_16cubed_train.h5")
+    test_path = os.path.join(out_dir, "cond_diffusion_16cubed_test.h5")
 
     for p in [train_path, test_path]:
         if os.path.exists(p):
@@ -520,7 +574,10 @@ def main():
             f.attrs["cube_log10_mean"] = cube_mean
             f.attrs["cube_log10_std"] = cube_std
 
-            f.attrs["image_channels"] = np.array([b"mass_xy", b"gal_xy", b"gal_vz_xy"], dtype="S16")
+            f.attrs["image_channels"] = np.array(
+                [b"mass_xy", b"gal_xy", b"gal_vz_xy", b"gal_vz_disp_xy"],
+                dtype="S20"
+            )
             f.attrs["density_cube_order"] = "zyx"
             f.attrs["gal_feature_columns"] = np.array([b"x", b"y", b"vz", b"Ngal"], dtype="S8")
             f.attrs["gal_target_columns"] = np.array([b"z", b"vx", b"vy"], dtype="S8")

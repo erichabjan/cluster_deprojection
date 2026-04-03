@@ -12,8 +12,8 @@ from train_conditional_diffusion import preload_hdf5_to_memory, train_model
 
 def main():
     data_path = "/projects/mccleary_group/habjan.e/TNG/Data/conditional_diffusion_data/"
-    train_file = "cond_diffusion_train.h5"
-    test_file = "cond_diffusion_test.h5"
+    train_file = "cond_diffusion_16cubed_train.h5"
+    test_file = "cond_diffusion_16cubed_test.h5"
 
     train_path = os.path.join(data_path, train_file)
     test_path = os.path.join(data_path, test_file)
@@ -26,6 +26,9 @@ def main():
         channel_mults=(1, 2, 4),
         time_emb_dim=128,
         out_channels=1,
+        galaxy_token_dim=128,
+        num_attention_heads=4,
+        coord_image_size=16,
     )
 
     model = ConditionalUNet3D(cfg=cfg)
@@ -47,14 +50,12 @@ def main():
     beta_start = 1e-4
     beta_end = 2e-2
 
-    suffix = "_64cube_v2"
+    suffix = "_16cube_v7"
 
     wandb_notes = (
-        "Conditional 3D diffusion model. "
-        "Conditioning inputs: images=(mass_xy, gal_xy, gal_vz_xy). "
-        "Target: normalized total-mass 3D density cube. "
-        "Small conditional 3D U-Net with global 2D conditioning embedding. "
-        "DDPM-style epsilon prediction objective."
+        "Conditional 3D diffusion model"
+        "Galaxy token cross attention and image conditioning"
+        "Equal Fusion"
     )
 
     cfg_dict = dict(
@@ -62,8 +63,13 @@ def main():
         channel_mults=str(cfg.channel_mults),
         time_emb_dim=int(cfg.time_emb_dim),
         out_channels=int(cfg.out_channels),
+        galaxy_token_dim=int(cfg.galaxy_token_dim),
+        num_attention_heads=int(cfg.num_attention_heads),
+        coord_image_size=int(cfg.coord_image_size),
         image_storage="(S,C,H,W) in HDF5; transposed to (B,H,W,C) in loader",
         cube_storage="(S,Z,Y,X) in HDF5; expanded to (B,Z,Y,X,1) in loader",
+        gal_feature_columns="(x, y, vz, Ngal)",
+        gal_pixel_coord_columns="(x_pix, y_pix)",
     )
 
     trained_state, train_losses, test_losses, diffusion_cfg = train_model(
@@ -82,6 +88,10 @@ def main():
         beta_end=beta_end,
         wandb_notes=wandb_notes,
         cfg_dict=cfg_dict,
+        checkpoint_dir = "/home/habjan.e/TNG/Sandbox_notebooks/phase_space_recon/cond_diff_old_models/checkpoints",
+        checkpoint_prefix = f"cond_diffusion_runtime{suffix}",
+        max_runtime_hours = 7.7,
+        runtime_buffer_minutes = 15.0,
     )
 
     out_dir = os.path.join(os.getcwd(), "conditional_diffusion_models")
