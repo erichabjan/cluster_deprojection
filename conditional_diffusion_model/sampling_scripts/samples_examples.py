@@ -14,9 +14,9 @@ sys.path.append('/home/habjan.e/TNG/cluster_deprojection/conditional_diffusion_m
 from conditional_diffusion_3d_model import ConditionalUNet3D, DiffusionModelConfig
 from train_conditional_diffusion import preload_hdf5_to_memory, sample_ddpm
 
-suffix = '_16cube_v7'
+suffix = "_16cube_16img_v9"
 
-val_path = "/projects/mccleary_group/habjan.e/TNG/Data/conditional_diffusion_data/cond_diffusion_16cubed_test.h5"
+val_path = "/projects/mccleary_group/habjan.e/TNG/Data/conditional_diffusion_data/cond_diffusion_16cubed_16img_test.h5"
 
 model_dir = "/home/habjan.e/TNG/cluster_deprojection/conditional_diffusion_model/conditional_diffusion_models"
 param_path = os.path.join(model_dir, f"cond_diffusion_params{suffix}.pkl")

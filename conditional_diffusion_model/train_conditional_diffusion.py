@@ -153,6 +153,9 @@ def diffusion_loss(
     timesteps,
     noise,
     alpha_bars,
+    floor_value=-5.0,
+    bg_weight=0.02,
+    fg_weight=1.0,
 ):
     noisy = q_sample(cubes, timesteps, noise, alpha_bars)
     pred_noise = apply_fn(
@@ -164,7 +167,10 @@ def diffusion_loss(
         gal_pixel_coords=gal_pixel_coords,
         gal_mask=mask,
     )
+    #weights = jnp.where(cubes <= floor_value + 1e-6, bg_weight, fg_weight)
+    #sqerr = (pred_noise - noise) ** 2
     return jnp.mean((pred_noise - noise) ** 2)
+    #return jnp.sum(weights * sqerr) / jnp.sum(weights)
 
 
 @jax.jit

@@ -231,6 +231,108 @@ def log_standardize_with_floor(
     return out
 
 
+# ============================================================
+# Global cube targets: enclosed mass and shape-tensor axis lengths
+# ============================================================
+
+def rho_cube_to_mass_msun(rho_cube: np.ndarray, fov_mpc: float) -> float:
+    """
+    rho_cube: (Z,Y,X) density in Msun / Mpc^3
+    Returns enclosed mass in Msun.
+    """
+    N = rho_cube.shape[0]
+    voxel_size = (2.0 * fov_mpc) / N
+    voxel_vol = voxel_size ** 3
+    return float(np.sum(rho_cube.astype(np.float64)) * voxel_vol)
+
+
+def rho_cube_to_axis_lengths_mpc(rho_cube: np.ndarray, fov_mpc: float) -> Tuple[float, float, float]:
+    """
+    rho_cube: (Z,Y,X) density in Msun / Mpc^3
+    Returns mass-weighted shape-tensor axis lengths (a, b, c) in Mpc, sorted largest to smallest.
+    """
+    N = rho_cube.shape[0]
+    voxel_size = (2.0 * fov_mpc) / N
+    voxel_vol = voxel_size ** 3
+
+    mass = rho_cube.astype(np.float64) * voxel_vol
+    total_mass = np.sum(mass)
+
+    if total_mass <= 0:
+        return float("nan"), float("nan"), float("nan")
+
+    coords_1d = (np.arange(N, dtype=np.float64) + 0.5) * voxel_size - fov_mpc
+    z, y, x = np.meshgrid(coords_1d, coords_1d, coords_1d, indexing="ij")
+
+    x_com = np.sum(mass * x) / total_mass
+    y_com = np.sum(mass * y) / total_mass
+    z_com = np.sum(mass * z) / total_mass
+
+    dx = x - x_com
+    dy = y - y_com
+    dz = z - z_com
+
+    S_xx = np.sum(mass * dx * dx) / total_mass
+    S_yy = np.sum(mass * dy * dy) / total_mass
+    S_zz = np.sum(mass * dz * dz) / total_mass
+    S_xy = np.sum(mass * dx * dy) / total_mass
+    S_xz = np.sum(mass * dx * dz) / total_mass
+    S_yz = np.sum(mass * dy * dz) / total_mass
+
+    S = np.array([
+        [S_xx, S_xy, S_xz],
+        [S_xy, S_yy, S_yz],
+        [S_xz, S_yz, S_zz],
+    ], dtype=np.float64)
+
+    evals = np.linalg.eigvalsh(S)
+    evals = np.sort(evals)[::-1]
+    a, b, c = np.sqrt(np.clip(evals, 0.0, None))
+    return float(a), float(b), float(c)
+
+
+def cube_to_mass_msun(cube_norm: np.ndarray, metadata: Dict) -> float:
+    """
+    cube_norm: (Z,Y,X) log-standardized cube as stored in the HDF5 file
+    metadata:  dict of HDF5 file attrs (e.g. preload_hdf5_to_memory(...)["metadata"])
+
+    Returns enclosed mass in Msun by inverting the cube normalization.
+    """
+    cube_mean = float(metadata["cube_log10_mean"])
+    cube_std = float(metadata["cube_log10_std"])
+    floor_value = float(metadata["floor_value"])
+    fov_mpc = float(metadata["map_fov_mpc"])
+    N = int(metadata["cube_resolution"])
+
+    rho = np.zeros_like(cube_norm, dtype=np.float64)
+    mask = cube_norm > floor_value + 1e-6
+    rho[mask] = 10.0 ** (cube_norm[mask] * cube_std + cube_mean)
+
+    voxel_size = (2.0 * fov_mpc) / N
+    voxel_vol = voxel_size ** 3
+    return float(np.sum(rho) * voxel_vol)
+
+
+def cube_to_axis_lengths_mpc(cube_norm: np.ndarray, metadata: Dict) -> Tuple[float, float, float]:
+    """
+    cube_norm: (Z,Y,X) log-standardized cube as stored in the HDF5 file
+    metadata:  dict of HDF5 file attrs (e.g. preload_hdf5_to_memory(...)["metadata"])
+
+    Returns mass-weighted shape-tensor axis lengths (a, b, c) in Mpc, sorted largest to smallest,
+    by inverting the cube normalization.
+    """
+    cube_mean = float(metadata["cube_log10_mean"])
+    cube_std = float(metadata["cube_log10_std"])
+    floor_value = float(metadata["floor_value"])
+    fov_mpc = float(metadata["map_fov_mpc"])
+
+    rho = np.zeros_like(cube_norm, dtype=np.float64)
+    mask = cube_norm > floor_value + 1e-6
+    rho[mask] = 10.0 ** (cube_norm[mask] * cube_std + cube_mean)
+
+    return rho_cube_to_axis_lengths_mpc(rho, fov_mpc)
+
+
 def xy_to_pixel_coords(x: np.ndarray, y: np.ndarray, cfg: GridConfig) -> np.ndarray:
     H = W = cfg.image_resolution
     xlim = (-cfg.fov_mpc, cfg.fov_mpc)
@@ -353,6 +455,15 @@ def build_one_sample(args) -> Dict[str, np.ndarray]:
     )
 
     # -------------------------------
+    # Global cube targets: log10 enclosed mass and shape-tensor axis lengths.
+    # Computed from the raw density cube (Msun/Mpc^3) to avoid floor roundtrip error.
+    # -------------------------------
+    cube_mass_msun = rho_cube_to_mass_msun(density_cube, grid_cfg.fov_mpc)
+    cube_mass_log10_msun = np.log10(max(cube_mass_msun, 1e-30))
+    a_mpc, b_mpc, c_mpc = rho_cube_to_axis_lengths_mpc(density_cube, grid_cfg.fov_mpc)
+    axis_lengths_mpc = np.array([a_mpc, b_mpc, c_mpc], dtype=np.float32)
+
+    # -------------------------------
     # Galaxy catalog save
     # -------------------------------
     gal_pixel_coords = xy_to_pixel_coords(x, y, grid_cfg)
@@ -395,6 +506,9 @@ def build_one_sample(args) -> Dict[str, np.ndarray]:
         gal_pixel_coords=pix_pad,
         mask=mask,
 
+        cube_mass_log10_msun=np.float32(cube_mass_log10_msun),
+        axis_lengths_mpc=axis_lengths_mpc,
+
         n_gal=np.int32(N_gal),
         proj_vec=np.asarray(proj_vec, dtype=np.float32),
         sim=str(sim),
@@ -416,6 +530,10 @@ def write_sample_to_hdf5(
     cube_mean: float,
     cube_std: float,
     floor_value: float,
+    cube_mass_log10_mean: float,
+    cube_mass_log10_std: float,
+    axis_mean: np.ndarray,
+    axis_std: np.ndarray,
 ):
     grp = h5.create_group(f"{sample_id:06d}")
     grp.attrs["id"] = int(sample_id)
@@ -441,6 +559,16 @@ def write_sample_to_hdf5(
         axis=0
     ).astype(np.float32)
 
+    raw_mass_log10 = float(sample["cube_mass_log10_msun"])
+    raw_axes = np.asarray(sample["axis_lengths_mpc"], dtype=np.float32)
+
+    std_mass = (raw_mass_log10 - cube_mass_log10_mean) / cube_mass_log10_std
+    std_axes = (raw_axes.astype(np.float64) - axis_mean) / axis_std
+    globals_target = np.concatenate(
+        [np.array([std_mass], dtype=np.float32), std_axes.astype(np.float32)],
+        axis=0,
+    )
+
     grp.create_dataset("projection_vector", data=sample["proj_vec"])
     grp.create_dataset("images", data=images, compression="gzip")               # (4,H,W)
     grp.create_dataset("density_cube", data=cube, compression="gzip")           # (Z,Y,X)
@@ -448,6 +576,10 @@ def write_sample_to_hdf5(
     grp.create_dataset("gal_targets", data=sample["gal_targets"], compression="gzip")
     grp.create_dataset("gal_pixel_coords", data=sample["gal_pixel_coords"], compression="gzip")
     grp.create_dataset("mask", data=sample["mask"], compression="gzip")
+
+    grp.create_dataset("cube_mass_log10_msun", data=np.float32(raw_mass_log10))
+    grp.create_dataset("axis_lengths_mpc", data=raw_axes)
+    grp.create_dataset("globals_target", data=globals_target)
 
 
 # ============================================================
@@ -459,8 +591,8 @@ def main():
     out_dir = "/projects/mccleary_group/habjan.e/TNG/Data/conditional_diffusion_data/"
     os.makedirs(out_dir, exist_ok=True)
 
-    train_path = os.path.join(out_dir, "cond_diffusion_16cubed_train.h5")
-    test_path = os.path.join(out_dir, "cond_diffusion_16cubed_test.h5")
+    train_path = os.path.join(out_dir, "cond_diffusion_16cubed_16img_train.h5")
+    test_path = os.path.join(out_dir, "cond_diffusion_16cubed_16img_test.h5")
 
     for p in [train_path, test_path]:
         if os.path.exists(p):
@@ -481,8 +613,8 @@ def main():
     max_nodes = 700
     grid_cfg = GridConfig(
         fov_mpc=5.0,
-        image_resolution=64,
-        cube_resolution=64,
+        image_resolution=16,
+        cube_resolution=16,
         vz_max_kms=4000.0,
         floor_value=-5.0,
     )
@@ -554,6 +686,26 @@ def main():
     print(f"Projected mass log10 mean/std: {mass_mean:.6f}, {mass_std:.6f}")
     print(f"3D density   log10 mean/std: {cube_mean:.6f}, {cube_std:.6f}")
 
+    # Global cube targets (mass + 3 axis lengths) stats over train set.
+    train_mass_log10_globals = np.array(
+        [float(s["cube_mass_log10_msun"]) for s in raw_train_samples],
+        dtype=np.float64,
+    )
+    train_axes = np.stack(
+        [np.asarray(s["axis_lengths_mpc"], dtype=np.float64) for s in raw_train_samples],
+        axis=0,
+    )  # (Ntrain, 3)
+
+    cube_mass_log10_mean = float(np.mean(train_mass_log10_globals))
+    cube_mass_log10_std = float(np.std(train_mass_log10_globals) + 1e-6)
+
+    axis_mean = np.mean(train_axes, axis=0).astype(np.float64)         # (3,)
+    axis_std = (np.std(train_axes, axis=0) + 1e-6).astype(np.float64)  # (3,)
+
+    print(f"Cube mass log10(Msun) mean/std: {cube_mass_log10_mean:.6f}, {cube_mass_log10_std:.6f}")
+    print(f"Axis lengths Mpc mean (a,b,c) : {axis_mean[0]:.6f}, {axis_mean[1]:.6f}, {axis_mean[2]:.6f}")
+    print(f"Axis lengths Mpc std  (a,b,c) : {axis_std[0]:.6f}, {axis_std[1]:.6f}, {axis_std[2]:.6f}")
+
     with h5py.File(train_path, "w") as f_train, h5py.File(test_path, "w") as f_test:
         for f in [f_train, f_test]:
             f.attrs["map_fov_mpc"] = grid_cfg.fov_mpc
@@ -574,6 +726,15 @@ def main():
             f.attrs["cube_log10_mean"] = cube_mean
             f.attrs["cube_log10_std"] = cube_std
 
+            f.attrs["cube_mass_log10_mean"] = cube_mass_log10_mean
+            f.attrs["cube_mass_log10_std"] = cube_mass_log10_std
+            f.attrs["axis_mean"] = axis_mean.astype(np.float64)
+            f.attrs["axis_std"] = axis_std.astype(np.float64)
+            f.attrs["globals_target_columns"] = np.array(
+                [b"mass_log10_msun", b"axis_a_mpc", b"axis_b_mpc", b"axis_c_mpc"],
+                dtype="S20",
+            )
+
             f.attrs["image_channels"] = np.array(
                 [b"mass_xy", b"gal_xy", b"gal_vz_xy", b"gal_vz_disp_xy"],
                 dtype="S20"
@@ -588,7 +749,9 @@ def main():
             write_sample_to_hdf5(
                 f_train, sid, sample,
                 mass_mean, mass_std, cube_mean, cube_std,
-                grid_cfg.floor_value
+                grid_cfg.floor_value,
+                cube_mass_log10_mean, cube_mass_log10_std,
+                axis_mean, axis_std,
             )
             if (sid + 1) % 250 == 0:
                 print(f"  wrote train {sid + 1}/{len(raw_train_samples)}")
@@ -598,7 +761,9 @@ def main():
             write_sample_to_hdf5(
                 f_test, sid, sample,
                 mass_mean, mass_std, cube_mean, cube_std,
-                grid_cfg.floor_value
+                grid_cfg.floor_value,
+                cube_mass_log10_mean, cube_mass_log10_std,
+                axis_mean, axis_std,
             )
             if (sid + 1) % 250 == 0:
                 print(f"  wrote test {sid + 1}/{len(raw_test_samples)}")

@@ -12,8 +12,8 @@ from train_conditional_diffusion import preload_hdf5_to_memory, train_model
 
 def main():
     data_path = "/projects/mccleary_group/habjan.e/TNG/Data/conditional_diffusion_data/"
-    train_file = "cond_diffusion_16cubed_train.h5"
-    test_file = "cond_diffusion_16cubed_test.h5"
+    train_file = "cond_diffusion_16cubed_16img_train.h5"
+    test_file = "cond_diffusion_16cubed_16img_test.h5"
 
     train_path = os.path.join(data_path, train_file)
     test_path = os.path.join(data_path, test_file)
@@ -50,12 +50,14 @@ def main():
     beta_start = 1e-4
     beta_end = 2e-2
 
-    suffix = "_16cube_v7"
+    suffix = "_16cube_16img_v9"
 
     wandb_notes = (
-        "Conditional 3D diffusion model"
-        "Galaxy token cross attention and image conditioning"
-        "Equal Fusion"
+        "Conditional 3D diffusion model. "
+        "16^3 cube with 16x16 images. "
+        "Galaxy token cross attention and image conditioning. "
+        "Uniform MSE loss (no floor weighting). "
+        "Testing cross-attention at reduced resolution."
     )
 
     cfg_dict = dict(
