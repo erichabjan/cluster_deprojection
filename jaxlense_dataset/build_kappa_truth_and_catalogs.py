@@ -120,43 +120,62 @@ def _empty_catalog():
 
 def draw_shape_catalog(kappa_inf, gamma1_inf, gamma2_inf, fov_mpc, z_l, rng):
     """
-    Bahe+ 2012 sec 3.2 with Smail n(z):
-      - n_source = 30/arcmin^2 over an annulus [r_inner_arcsec, r_outer_arcmin]
+    Synthetic source catalog:
+      - n_source = CFG_LENS.n_source_per_arcmin2 over the full rectangular FoV
+      - remove sources inside r_inner_arcsec to avoid strongly lensed/core region
       - per-galaxy z_s ~ Smail
-      - magnification thinning with rate ~ mu^(2.5*alpha_mag - 1)
+      - optional magnification thinning with rate ~ mu^(2.5*alpha_mag - 1)
       - reduced shear g = beta*gamma_inf / (1 - beta*kappa_inf)
-      - epsilon_obs = (epsilon_int + g) / (1 + g* epsilon_int)
+      - epsilon_obs = (epsilon_int + g) / (1 + conj(g)*epsilon_int)
     """
-    D_l = lu.angular_diameter_distance_mpc(z_l, H0=CFG_COSMO.H0, Om0=CFG_COSMO.Om0)
+    D_l = lu.angular_diameter_distance_mpc(
+        z_l, H0=CFG_COSMO.H0, Om0=CFG_COSMO.Om0
+    )
     arcmin_per_mpc = (180.0 * 60.0 / np.pi) / D_l
-    r_in_mpc = (CFG_LENS.r_inner_arcsec / 60.0) / arcmin_per_mpc
-    r_out_mpc = CFG_LENS.r_outer_arcmin / arcmin_per_mpc
-    r_out_mpc = min(r_out_mpc, fov_mpc * 0.99)              # keep inside the box
 
-    area_arcmin2 = np.pi * (CFG_LENS.r_outer_arcmin ** 2
-                            - (CFG_LENS.r_inner_arcsec / 60.0) ** 2)
-    n_mean = CFG_LENS.n_source_per_arcmin2 * area_arcmin2
+    # Inner circular exclusion region in physical Mpc.
+    r_in_mpc = (CFG_LENS.r_inner_arcsec / 60.0) / arcmin_per_mpc
+
+    # Expected number of sources over the rectangular FoV,
+    # excluding the inner strong-lensing/core region.
+    field_side_arcmin = 2.0 * fov_mpc * arcmin_per_mpc
+    field_area_arcmin2 = field_side_arcmin ** 2
+    inner_area_arcmin2 = np.pi * (CFG_LENS.r_inner_arcsec / 60.0) ** 2
+    usable_area_arcmin2 = max(field_area_arcmin2 - inner_area_arcmin2, 0.0)
+
+    n_mean = CFG_LENS.n_source_per_arcmin2 * usable_area_arcmin2
 
     exponent = 2.5 * CFG_LENS.alpha_mag - 1.0
-    weight_max_bound = max(CFG_LENS.mu_max ** exponent,
-                           (1.0 / CFG_LENS.mu_max) ** exponent)
+    weight_max_bound = max(
+        CFG_LENS.mu_max ** exponent,
+        (1.0 / CFG_LENS.mu_max) ** exponent,
+    )
     if not CFG_LENS.use_magnification_bias:
         weight_max_bound = 1.0
 
-    n_proposed = int(rng.poisson(n_mean * weight_max_bound * CFG_LENS.oversample_safety))
+    n_proposed = int(
+        rng.poisson(n_mean * weight_max_bound * CFG_LENS.oversample_safety)
+    )
     if n_proposed == 0:
         return _empty_catalog()
 
-    # rejection-sample positions in the annulus from a uniform square proposal
-    cand_x = np.empty(0); cand_y = np.empty(0)
+    # Draw sources uniformly over the rectangular FoV,
+    # rejecting only the inner core.
+    cand_x = np.empty(0, dtype=np.float64)
+    cand_y = np.empty(0, dtype=np.float64)
+
     while cand_x.size < n_proposed:
         chunk = max(n_proposed - cand_x.size, 256)
-        rx = rng.uniform(-r_out_mpc, r_out_mpc, size=chunk * 2)
-        ry = rng.uniform(-r_out_mpc, r_out_mpc, size=chunk * 2)
+
+        rx = rng.uniform(-fov_mpc, fov_mpc, size=chunk * 2)
+        ry = rng.uniform(-fov_mpc, fov_mpc, size=chunk * 2)
+
         rr = np.sqrt(rx ** 2 + ry ** 2)
-        keep = (rr >= r_in_mpc) & (rr <= r_out_mpc)
+        keep = rr >= r_in_mpc
+
         cand_x = np.concatenate([cand_x, rx[keep]])
         cand_y = np.concatenate([cand_y, ry[keep]])
+
     x_g = cand_x[:n_proposed].astype(np.float64)
     y_g = cand_y[:n_proposed].astype(np.float64)
 

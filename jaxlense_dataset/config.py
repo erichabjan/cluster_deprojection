@@ -93,13 +93,13 @@ class ScoreNetConfig:
 
 @dataclass
 class DLPosteriorConfig:
-    batch_size: int = 8                   # parallel chains per call
+    batch_size: int = 100                   # parallel chains per call
     n_independent_seeds: int = 4          # × batch_size = total samples per cluster
     initial_temperature: float = 0.15
     initial_step_size: float = 0.01
-    min_steps_per_temp: int = 10
-    num_steps_between_results: int = 6000
-    cooling_gamma: float = 0.98
+    min_steps_per_temp: int = 50
+    num_steps_between_results: int = 20000
+    cooling_gamma: float = 0.99
     min_temperature: float = 8e-3
 
 
