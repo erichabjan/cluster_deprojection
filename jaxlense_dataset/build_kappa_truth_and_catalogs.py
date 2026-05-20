@@ -30,6 +30,14 @@ import lensing_utils as lu
 BOXSIZE_MPC_OVER_H = 400.0   # BAHAMAS box (cMpc/h)
 EPS = 1e-9
 
+# Populated by _init_worker when source_redshift_mode == 'empirical'.
+_EMPIRICAL_Z_TEMPLATE = None
+
+
+def _init_worker(z_template):
+    global _EMPIRICAL_Z_TEMPLATE
+    _EMPIRICAL_Z_TEMPLATE = z_template
+
 
 def _bin3d_sum(x, y, z, w, lim, N):
     H, _ = np.histogramdd(
@@ -118,14 +126,18 @@ def _empty_catalog():
             for k in ("x", "y", "z_s", "beta", "e1_obs", "e2_obs")}
 
 
-def draw_shape_catalog(kappa_inf, gamma1_inf, gamma2_inf, fov_mpc, z_l, rng):
+def draw_shape_catalog(kappa_inf, gamma1_inf, gamma2_inf, sigma_crit_inf,
+                       fov_mpc, z_l, rng):
     """
     Synthetic source catalog:
       - n_source = CFG_LENS.n_source_per_arcmin2 over the full rectangular FoV
       - remove sources inside r_inner_arcsec to avoid strongly lensed/core region
       - per-galaxy z_s ~ Smail
       - optional magnification thinning with rate ~ mu^(2.5*alpha_mag - 1)
-      - reduced shear g = beta*gamma_inf / (1 - beta*kappa_inf)
+      - per-source convergence/shear use the per-source critical surface density
+            Sigma_crit(z_l, z_s) = c^2 / (4 pi G) * D_s / (D_l * D_ls),
+        equivalently kappa_eff(x_i) = Sigma(x_i) / Sigma_crit(z_l, z_{s,i}).
+      - reduced shear g = gamma_eff / (1 - kappa_eff)
       - epsilon_obs = (epsilon_int + g) / (1 + conj(g)*epsilon_int)
     """
     D_l = lu.angular_diameter_distance_mpc(
@@ -179,19 +191,46 @@ def draw_shape_catalog(kappa_inf, gamma1_inf, gamma2_inf, fov_mpc, z_l, rng):
     x_g = cand_x[:n_proposed].astype(np.float64)
     y_g = cand_y[:n_proposed].astype(np.float64)
 
-    z_s = lu.sample_smail_redshifts(
-        n_proposed,
-        alpha=CFG_LENS.smail_alpha, beta=CFG_LENS.smail_beta, z0=CFG_LENS.smail_z0,
-        z_max=CFG_LENS.smail_z_max, rng=rng)
-    beta = lu.beta_factor(z_l, z_s, H0=CFG_COSMO.H0, Om0=CFG_COSMO.Om0)
+    mode = CFG_LENS.source_redshift_mode
+    if mode == "analytic":
+        z_s = lu.sample_smail_redshifts(
+            n_proposed,
+            alpha=CFG_LENS.smail_alpha, beta=CFG_LENS.smail_beta, z0=CFG_LENS.smail_z0,
+            z_max=CFG_LENS.smail_z_max, rng=rng)
+    elif mode == "empirical":
+        if _EMPIRICAL_Z_TEMPLATE is None:
+            raise RuntimeError(
+                "source_redshift_mode='empirical' but worker has no z_template "
+                "(Pool initializer was not run)."
+            )
+        z_s = lu.sample_empirical_redshifts(n_proposed, _EMPIRICAL_Z_TEMPLATE, rng=rng)
+    else:
+        raise ValueError(
+            f"Unknown CFG_LENS.source_redshift_mode={mode!r}; expected 'analytic' or 'empirical'."
+        )
+
+    # Per-source critical surface density Sigma_crit(z_l, z_s), and the
+    # rescaling factor that converts kappa_inf -> kappa at each source's z_s.
+    # By construction Sigma_crit_inf / Sigma_crit(z_l, z_s) = D_ls/D_s = beta(z_l, z_s),
+    # which is +0 for foreground sources (Sigma_crit -> +inf).
+    sigma_crit_src = lu.sigma_crit_msun_per_mpc2(
+        z_l, z_s, H0=CFG_COSMO.H0, Om0=CFG_COSMO.Om0)
+    beta = sigma_crit_inf / sigma_crit_src
 
     k_inf_g = lu.bilinear_sample(kappa_inf, x_g, y_g, fov_mpc)
     g1_inf_g = lu.bilinear_sample(gamma1_inf, x_g, y_g, fov_mpc)
     g2_inf_g = lu.bilinear_sample(gamma2_inf, x_g, y_g, fov_mpc)
 
-    k_eff = beta * k_inf_g
-    g1_eff = beta * g1_inf_g
-    g2_eff = beta * g2_inf_g
+    # kappa_eff(x_i) = Sigma(x_i) / Sigma_crit(z_l, z_{s,i})
+    #               = (Sigma_crit_inf / Sigma_crit(z_l, z_{s,i})) * kappa_inf(x_i),
+    # and the same rescaling applies to gamma_inf (KS is linear in Sigma).
+    sigma_at_src = sigma_crit_inf * k_inf_g
+    sigma_g1_at_src = sigma_crit_inf * g1_inf_g
+    sigma_g2_at_src = sigma_crit_inf * g2_inf_g
+
+    k_eff = sigma_at_src / sigma_crit_src
+    g1_eff = sigma_g1_at_src / sigma_crit_src
+    g2_eff = sigma_g2_at_src / sigma_crit_src
 
     # magnification mu = 1 / |(1-k)^2 - |gamma|^2|; clipped to avoid critical curves
     denom = (1.0 - k_eff) ** 2 - (g1_eff ** 2 + g2_eff ** 2)
@@ -251,8 +290,8 @@ def build_one_sample(args) -> Dict:
     gamma1_inf = gamma1_inf.astype(np.float32)
     gamma2_inf = gamma2_inf.astype(np.float32)
 
-    cat = draw_shape_catalog(kappa_inf, gamma1_inf, gamma2_inf, fov,
-                             CFG_LENS.z_lens_assumed, rng)
+    cat = draw_shape_catalog(kappa_inf, gamma1_inf, gamma2_inf, sigma_crit_inf,
+                             fov, CFG_LENS.z_lens_assumed, rng)
 
     if cat["x"].size > 0:
         gamma1_obs, n_gal_pix = lu.bin2d_mean(cat["x"], cat["y"], cat["e1_obs"], fov, N_lens)
@@ -266,7 +305,7 @@ def build_one_sample(args) -> Dict:
 
     density_cube = build_density_cube(components, fov, N_cube)
 
-    return dict(
+    out = dict(
         sample_id=int(sample_id),
         cluster_idx=int(cluster_idx),
         sim=str(sim),
@@ -288,6 +327,16 @@ def build_one_sample(args) -> Dict:
         n_member=int(gal_pos.shape[0]),
     )
 
+    if CFG_DATA.save_source_catalog:
+        out["src_x"] = cat["x"]
+        out["src_y"] = cat["y"]
+        out["src_z_s"] = cat["z_s"]
+        out["src_beta"] = cat["beta"]
+        out["src_e1_obs"] = cat["e1_obs"]
+        out["src_e2_obs"] = cat["e2_obs"]
+
+    return out
+
 
 def write_sample(out_dir, sample):
     fname = os.path.join(out_dir, f"sample_{sample['sample_id']:06d}.npz")
@@ -299,6 +348,28 @@ def main():
     out_root = CFG_DATA.output_root
     interim_dir = os.path.join(out_root, CFG_DATA.intermediate_dirname)
     os.makedirs(interim_dir, exist_ok=True)
+
+    if CFG_LENS.source_redshift_mode == "empirical":
+        z_raw = np.load(CFG_LENS.empirical_redshift_npz_path)[
+            CFG_LENS.empirical_redshift_key
+        ]
+        z_template = np.asarray(z_raw, dtype=np.float64)
+        z_template = z_template[z_template > CFG_LENS.z_lens_assumed]
+        if z_template.size == 0:
+            raise ValueError(
+                f"empirical redshift template at {CFG_LENS.empirical_redshift_npz_path} "
+                f"(key={CFG_LENS.empirical_redshift_key!r}) has no entries above "
+                f"z_lens_assumed={CFG_LENS.z_lens_assumed}"
+            )
+        print(
+            f"empirical n(z): loaded {z_template.size} sources from "
+            f"{CFG_LENS.empirical_redshift_npz_path} [{CFG_LENS.empirical_redshift_key}], "
+            f"<z>={z_template.mean():.3f}, min={z_template.min():.3f}, max={z_template.max():.3f}"
+        )
+    else:
+        z_template = None
+        print(f"analytic n(z): Smail (alpha={CFG_LENS.smail_alpha}, "
+              f"beta={CFG_LENS.smail_beta}, z0={CFG_LENS.smail_z0})")
 
     cluster_inds = np.array([f"{i:03d}" for i in range(*CFG_DATA.cluster_index_range)])
     sims = list(CFG_DATA.simulations)
@@ -332,7 +403,11 @@ def main():
     n_workers = int(os.environ.get("SLURM_CPUS_PER_TASK", "1"))
     print(f"using {n_workers} workers; starting build...")
 
-    with mp.get_context("spawn").Pool(processes=n_workers) as pool:
+    with mp.get_context("spawn").Pool(
+        processes=n_workers,
+        initializer=_init_worker,
+        initargs=(z_template,),
+    ) as pool:
         for i, sample in enumerate(pool.imap_unordered(build_one_sample, jobs, chunksize=4),
                                    start=1):
             write_sample(interim_dir, sample)

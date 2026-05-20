@@ -26,9 +26,17 @@ class GridConfig:
 @dataclass
 class LensingConfig:
     # Snapshots are at z=0; assume the cluster lives at this redshift for lensing geometry.
-    z_lens_assumed: float = 0.25
-    n_source_per_arcmin2: float = 30.0
+    z_lens_assumed: float = 0.2
+    n_source_per_arcmin2: float = 15.0
     sigma_e_per_component: float = 0.2
+    # Source-redshift sampling: 'analytic' uses the Smail n(z) below; 'empirical'
+    # bootstraps from a representative array stored at empirical_redshift_npz_path
+    # under empirical_redshift_key (e.g. SuperBIT-selected source redshifts).
+    source_redshift_mode: str = "empirical"
+    empirical_redshift_npz_path: str = (
+        "/home/habjan.e/TNG/Data/superbit_redshifts/redshift_arrays.npz"
+    )
+    empirical_redshift_key: str = "selected_redshift"
     # Smail+ 1994 n(z) ~ z^alpha exp(-(z/z0)^beta); these give <z>~1.05, median~0.94
     smail_alpha: float = 2.0
     smail_beta: float = 1.5
@@ -77,6 +85,10 @@ class DatasetConfig:
     final_dirname: str = "final"
     train_h5_template: str = "cond_diffusion_jaxlense_{img}img_{cube}cubed_train.h5"
     test_h5_template: str = "cond_diffusion_jaxlense_{img}img_{cube}cubed_test.h5"
+    # When True, build_kappa_truth_and_catalogs.py also writes the per-source
+    # arrays (src_x, src_y, src_z_s, src_beta, src_e1_obs, src_e2_obs) into
+    # each sample npz. Off by default; turn on for diagnostic / debugging runs.
+    save_source_catalog: bool = False
 
 
 @dataclass
@@ -135,4 +147,18 @@ if _os.environ.get("JAXLENSE_SMOKE_TEST", "0") == "1":
         n_independent_seeds=1,
         num_steps_between_results=400,
         min_temperature=0.05,
+    )
+
+# Diagnostic override: set JAXLENSE_DIAG=1 to build 10 CDMb cluster projections
+# (one projection per cluster, clusters 001..010), persist the per-source
+# catalog, and write to a sandbox output_root so production data is untouched.
+# Used by Sandbox_notebooks/phase_space_recon/run_diag_10.py.
+if _os.environ.get("JAXLENSE_DIAG", "0") == "1":
+    CFG_DATA = DatasetConfig(
+        dataset_size=10,
+        test_fraction=0.0,
+        simulations=("CDMb",),
+        cluster_index_range=(1, 11),             # clusters 001..010
+        output_root="/projects/mccleary_group/habjan.e/TNG/Data/jaxlense_dataset_diag/",
+        save_source_catalog=True,
     )

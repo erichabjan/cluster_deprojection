@@ -51,6 +51,24 @@ def sigma_crit_inf_msun_per_mpc2(z_l, H0=70.0, Om0=0.3):
     return (C_LIGHT_KM_S ** 2) / (4.0 * np.pi * G_NEWTON_KM2_S2_MPC_MSUN * D_l)
 
 
+def sigma_crit_msun_per_mpc2(z_l, z_s, H0=70.0, Om0=0.3):
+    """
+    Per-source critical surface density:
+        Sigma_crit(z_l, z_s) = c^2 / (4 pi G) * D_s / (D_l * D_ls).
+    Returns Msun/Mpc^2. Foreground sources (z_s <= z_l) get +inf so that
+    1/Sigma_crit -> 0, i.e., they feel no lensing.
+    """
+    z_s = np.atleast_1d(z_s).astype(np.float64)
+    D_l = angular_diameter_distance_mpc(z_l, H0=H0, Om0=Om0)
+    D_s = angular_diameter_distance_mpc(z_s, H0=H0, Om0=Om0)
+    D_ls = angular_diameter_distance_z1z2_mpc(z_l, z_s, H0=H0, Om0=Om0)
+    pref = (C_LIGHT_KM_S ** 2) / (4.0 * np.pi * G_NEWTON_KM2_S2_MPC_MSUN)
+    denom = D_l * D_ls
+    return np.where(z_s > z_l,
+                    pref * D_s / np.clip(denom, 1e-30, None),
+                    np.inf)
+
+
 def beta_factor(z_l, z_s, H0=70.0, Om0=0.3):
     """beta(z_l, z_s) = D_ls / D_s * Heaviside(z_s - z_l). Vectorized over z_s."""
     z_s = np.atleast_1d(z_s).astype(np.float64)
@@ -79,6 +97,15 @@ def sample_smail_redshifts(n_samples, alpha=2.0, beta=1.5, z0=0.7, z_max=5.0, rn
     return np.interp(u, cdf, zg)
 
 
+def sample_empirical_redshifts(n_samples, z_template, rng=None):
+    """Bootstrap n_samples redshifts (with replacement) from z_template."""
+    if rng is None:
+        rng = np.random.default_rng()
+    if z_template.size == 0:
+        raise ValueError("sample_empirical_redshifts: z_template is empty")
+    return rng.choice(z_template, size=n_samples, replace=True)
+
+
 def mean_beta_over_smail(z_l, alpha=2.0, beta=1.5, z0=0.7, z_max=5.0,
                          H0=70.0, Om0=0.3, n_grid=4096):
     """<beta> over n(z); used to convert kappa_inf <-> recovered kappa_eff."""
@@ -86,6 +113,25 @@ def mean_beta_over_smail(z_l, alpha=2.0, beta=1.5, z0=0.7, z_max=5.0,
     nz = smail_pdf(zg, alpha, beta, z0)
     bz = beta_factor(z_l, zg, H0=H0, Om0=Om0)
     return float(np.trapz(bz * nz, zg) / np.trapz(nz, zg))
+
+
+def mean_beta_over_empirical(z_l, z_template, H0=70.0, Om0=0.3):
+    """
+    <beta> over the empirical source-redshift distribution used by
+    sample_empirical_redshifts (bootstrap with replacement). This is the
+    unweighted Monte Carlo average over the post-foreground-cut template:
+        <beta> = (1/M) sum_k beta(z_l, z^(k)),  z^(k) > z_l.
+    Matches the same n(z) that stage-1 catalogs are built against, so
+    kappa_train = <beta> * kappa_inf is self-consistent in empirical mode.
+    """
+    z_template = np.asarray(z_template, dtype=np.float64)
+    mask = z_template > z_l
+    if not mask.any():
+        raise ValueError(
+            f"mean_beta_over_empirical: no template entries above z_l={z_l}"
+        )
+    bz = beta_factor(z_l, z_template[mask], H0=H0, Om0=Om0)
+    return float(bz.mean())
 
 
 # ----- KS93 forward/inverse, numpy version (matches jax_lensing.inversion) -----

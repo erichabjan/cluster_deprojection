@@ -54,11 +54,25 @@ def main():
     pixel_size_arcmin = (2.0 * fov_mpc / N) * arcmin_per_mpc
     pixel_size_rad = pixel_size_arcmin * (np.pi / 180.0 / 60.0)
 
-    mean_beta = lu.mean_beta_over_smail(
-        CFG_LENS.z_lens_assumed,
-        alpha=CFG_LENS.smail_alpha, beta=CFG_LENS.smail_beta, z0=CFG_LENS.smail_z0,
-        z_max=CFG_LENS.smail_z_max, H0=CFG_COSMO.H0, Om0=CFG_COSMO.Om0)
-    print(f"<beta>={mean_beta:.6f}, pixel={pixel_size_arcmin:.4f} arcmin, "
+    mode = CFG_LENS.source_redshift_mode
+    if mode == "analytic":
+        mean_beta = lu.mean_beta_over_smail(
+            CFG_LENS.z_lens_assumed,
+            alpha=CFG_LENS.smail_alpha, beta=CFG_LENS.smail_beta, z0=CFG_LENS.smail_z0,
+            z_max=CFG_LENS.smail_z_max, H0=CFG_COSMO.H0, Om0=CFG_COSMO.Om0)
+    elif mode == "empirical":
+        z_template = np.asarray(
+            np.load(CFG_LENS.empirical_redshift_npz_path)[CFG_LENS.empirical_redshift_key],
+            dtype=np.float64,
+        )
+        mean_beta = lu.mean_beta_over_empirical(
+            CFG_LENS.z_lens_assumed, z_template,
+            H0=CFG_COSMO.H0, Om0=CFG_COSMO.Om0)
+    else:
+        raise ValueError(
+            f"Unknown CFG_LENS.source_redshift_mode={mode!r}; expected 'analytic' or 'empirical'."
+        )
+    print(f"<beta>={mean_beta:.6f} (mode={mode}), pixel={pixel_size_arcmin:.4f} arcmin, "
           f"pixel_rad={pixel_size_rad:.6e}")
 
     ps_sum = None
