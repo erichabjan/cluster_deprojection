@@ -14,8 +14,8 @@ from typing import Tuple
 
 @dataclass
 class GridConfig:
-    fov_mpc: float = 5.0                 # half-extent: FOV is [-fov_mpc, +fov_mpc]
-    lens_recon_resolution: int = 128     # native resolution for kappa, gamma, n_gal_pix, score-net
+    fov_mpc: float = 2.5                 # half-extent: FOV is [-fov_mpc, +fov_mpc]; halved from 5.0 so the angular FoV (~29 arcmin/side at z_l=0.2) approximately matches single-tile SuperBIT cluster footprints (A3411 covers ~24x26 arcmin) and the trained prior sees fully-populated maps in inference.
+    lens_recon_resolution: int = 64      # native resolution for kappa, gamma, n_gal_pix, score-net; halved with fov_mpc to keep the same 78 kpc/pixel physical scale the score net learned features at.
     interim_cube_resolution: int = 64    # 3D cube saved at this resolution; downsampled at stage 3
     final_image_resolution: int = 16     # default; configurable in stage 3
     final_cube_resolution: int = 16      # default; configurable in stage 3
@@ -28,7 +28,7 @@ class LensingConfig:
     # Snapshots are at z=0; assume the cluster lives at this redshift for lensing geometry.
     z_lens_assumed: float = 0.2
     n_source_per_arcmin2: float = 15.0
-    sigma_e_per_component: float = 0.2
+    sigma_e_per_component: float = 0.137
     # Source-redshift sampling: 'analytic' uses the Smail n(z) below; 'empirical'
     # bootstraps from a representative array stored at empirical_redshift_npz_path
     # under empirical_redshift_key (e.g. SuperBIT-selected source redshifts).

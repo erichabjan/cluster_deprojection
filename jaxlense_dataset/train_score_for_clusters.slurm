@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=jaxlense_score_train
 #SBATCH --output=/home/habjan.e/TNG/Sandbox_notebooks/phase_space_recon/jax_lense_slurm_logs/score_train_%j.log
-#SBATCH --time=8:00:00
+#SBATCH --time=1:00:00
 #SBATCH --mem=24G
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:a100:1
