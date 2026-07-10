@@ -1,9 +1,11 @@
 """
-Pure-numpy lensing utilities: cosmology, Smail n(z), KS93 forward/inverse, bilinear sampling,
-2D binning. No jax dependency, so this module is importable from both `cl_dyn` and `jax_lense`.
+Pure-numpy lensing utilities for the shape_dynamics dataset: flat-LambdaCDM
+distances, critical surface densities, empirical source-redshift sampling,
+KS93 inverse (kappa -> gamma), bilinear sampling, and 2D binning.
 
-Sign / Fourier conventions match jax_lensing.inversion (so KS-based truth from this module
-round-trips exactly with the jax-lensing reconstruction in stage 2).
+Trimmed from jaxlense_dataset/lensing_utils.py to only what
+draw_shape_catalog and the Sigma -> kappa -> gamma construction need.
+Sign / Fourier conventions match jax_lensing.inversion.
 """
 import numpy as np
 from typing import Tuple
@@ -17,16 +19,24 @@ G_NEWTON_KM2_S2_MPC_MSUN = 4.3009125e-9
 # ----- cosmology (flat LambdaCDM) -----
 
 def comoving_distance_mpc(z, H0=70.0, Om0=0.3, n_steps=2048):
-    """Comoving distance (Mpc) in flat LambdaCDM via trapezoidal quadrature."""
+    """
+    Comoving distance (Mpc) in flat LambdaCDM via trapezoidal quadrature.
+    Vectorized: one cumulative integral on a shared grid up to max(z), then
+    interpolated to each element (avoids a per-element Python loop, which is
+    prohibitive for the ~10^5-10^6 source catalogs drawn per sample).
+    """
     z_arr = np.atleast_1d(z).astype(np.float64)
-    out = np.zeros_like(z_arr)
-    for i, zi in enumerate(z_arr):
-        if zi <= 0.0:
-            out[i] = 0.0
-            continue
-        zg = np.linspace(0.0, zi, n_steps)
-        Ez = np.sqrt(Om0 * (1.0 + zg) ** 3 + (1.0 - Om0))
-        out[i] = (C_LIGHT_KM_S / H0) * np.trapz(1.0 / Ez, zg)
+    z_max = float(z_arr.max(initial=0.0))
+    if z_max <= 0.0:
+        out = np.zeros_like(z_arr)
+    else:
+        zg = np.linspace(0.0, z_max, n_steps)
+        inv_Ez = 1.0 / np.sqrt(Om0 * (1.0 + zg) ** 3 + (1.0 - Om0))
+        Dc_grid = np.concatenate([
+            [0.0],
+            np.cumsum(0.5 * (inv_Ez[1:] + inv_Ez[:-1]) * np.diff(zg)),
+        ]) * (C_LIGHT_KM_S / H0)
+        out = np.where(z_arr > 0.0, np.interp(z_arr, zg, Dc_grid), 0.0)
     return out if np.ndim(z) > 0 else float(out[0])
 
 
@@ -69,33 +79,7 @@ def sigma_crit_msun_per_mpc2(z_l, z_s, H0=70.0, Om0=0.3):
                     np.inf)
 
 
-def beta_factor(z_l, z_s, H0=70.0, Om0=0.3):
-    """beta(z_l, z_s) = D_ls / D_s * Heaviside(z_s - z_l). Vectorized over z_s."""
-    z_s = np.atleast_1d(z_s).astype(np.float64)
-    Ds = angular_diameter_distance_mpc(z_s, H0=H0, Om0=Om0)
-    Dls = angular_diameter_distance_z1z2_mpc(z_l, z_s, H0=H0, Om0=Om0)
-    out = np.where(z_s > z_l, Dls / np.clip(Ds, 1e-6, None), 0.0)
-    return out
-
-
-# ----- Smail n(z) -----
-
-def smail_pdf(z, alpha=2.0, beta=1.5, z0=0.7):
-    z = np.asarray(z)
-    return np.where(z > 0, (z ** alpha) * np.exp(-((z / z0) ** beta)), 0.0)
-
-
-def sample_smail_redshifts(n_samples, alpha=2.0, beta=1.5, z0=0.7, z_max=5.0, rng=None):
-    """Inverse-CDF sampling on a fine grid."""
-    if rng is None:
-        rng = np.random.default_rng()
-    zg = np.linspace(0.0, z_max, 4096)
-    pdf = smail_pdf(zg, alpha, beta, z0)
-    cdf = np.cumsum(pdf)
-    cdf = cdf / cdf[-1]
-    u = rng.uniform(size=n_samples)
-    return np.interp(u, cdf, zg)
-
+# ----- empirical n(z) sampling -----
 
 def sample_empirical_redshifts(n_samples, z_template, rng=None):
     """Bootstrap n_samples redshifts (with replacement) from z_template."""
@@ -106,35 +90,7 @@ def sample_empirical_redshifts(n_samples, z_template, rng=None):
     return rng.choice(z_template, size=n_samples, replace=True)
 
 
-def mean_beta_over_smail(z_l, alpha=2.0, beta=1.5, z0=0.7, z_max=5.0,
-                         H0=70.0, Om0=0.3, n_grid=4096):
-    """<beta> over n(z); used to convert kappa_inf <-> recovered kappa_eff."""
-    zg = np.linspace(z_l + 1e-3, z_max, n_grid)
-    nz = smail_pdf(zg, alpha, beta, z0)
-    bz = beta_factor(z_l, zg, H0=H0, Om0=Om0)
-    return float(np.trapz(bz * nz, zg) / np.trapz(nz, zg))
-
-
-def mean_beta_over_empirical(z_l, z_template, H0=70.0, Om0=0.3):
-    """
-    <beta> over the empirical source-redshift distribution used by
-    sample_empirical_redshifts (bootstrap with replacement). This is the
-    unweighted Monte Carlo average over the post-foreground-cut template:
-        <beta> = (1/M) sum_k beta(z_l, z^(k)),  z^(k) > z_l.
-    Matches the same n(z) that stage-1 catalogs are built against, so
-    kappa_train = <beta> * kappa_inf is self-consistent in empirical mode.
-    """
-    z_template = np.asarray(z_template, dtype=np.float64)
-    mask = z_template > z_l
-    if not mask.any():
-        raise ValueError(
-            f"mean_beta_over_empirical: no template entries above z_l={z_l}"
-        )
-    bz = beta_factor(z_l, z_template[mask], H0=H0, Om0=Om0)
-    return float(bz.mean())
-
-
-# ----- KS93 forward/inverse, numpy version (matches jax_lensing.inversion) -----
+# ----- KS93 inverse, numpy version (matches jax_lensing.inversion) -----
 
 def _ks_kernel(N):
     k1 = np.fft.fftfreq(N)
@@ -157,18 +113,6 @@ def ks93_inv_numpy(kE: np.ndarray, kB: np.ndarray) -> Tuple[np.ndarray, np.ndarr
     g1hat = (p1 * kEhat - p2 * kBhat) / k2sq
     g2hat = (p2 * kEhat + p1 * kBhat) / k2sq
     return np.fft.ifft2(g1hat).real, np.fft.ifft2(g2hat).real
-
-
-def ks93_numpy(g1: np.ndarray, g2: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """shear (g1, g2) -> convergence (kE, kB). Mirrors jax_lensing.inversion.ks93."""
-    assert g1.shape == g2.shape and g1.shape[0] == g1.shape[1]
-    N = g1.shape[0]
-    p1, p2, k2sq = _ks_kernel(N)
-    g1hat = np.fft.fft2(g1)
-    g2hat = np.fft.fft2(g2)
-    kEhat = (p1 * g1hat + p2 * g2hat) / k2sq
-    kBhat = -(p2 * g1hat - p1 * g2hat) / k2sq
-    return np.fft.ifft2(kEhat).real, np.fft.ifft2(kBhat).real
 
 
 # ----- bilinear sampling on a regular grid -----
@@ -205,31 +149,3 @@ def bin2d_sum(x, y, w, fov, N):
                              bins=(N, N), range=((-fov, fov), (-fov, fov)),
                              weights=w.astype(np.float64))
     return H.astype(np.float32)
-
-
-def bin2d_mean(x, y, w, fov, N):
-    s = bin2d_sum(x, y, w, fov, N)
-    c = bin2d_count(x, y, fov, N)
-    out = np.zeros_like(s, dtype=np.float32)
-    valid = c > 0
-    out[valid] = s[valid] / c[valid]
-    return out, c
-
-
-# ----- pooling -----
-
-def avg_pool_2d(arr: np.ndarray, factor: int) -> np.ndarray:
-    if factor == 1:
-        return arr
-    H, W = arr.shape
-    assert H % factor == 0 and W % factor == 0, f"avg_pool_2d: ({H},{W}) not divisible by {factor}"
-    return arr.reshape(H // factor, factor, W // factor, factor).mean(axis=(1, 3))
-
-
-def avg_pool_3d(arr: np.ndarray, factor: int) -> np.ndarray:
-    if factor == 1:
-        return arr
-    Z, Y, X = arr.shape
-    assert Z % factor == 0 and Y % factor == 0 and X % factor == 0, \
-        f"avg_pool_3d: ({Z},{Y},{X}) not divisible by {factor}"
-    return arr.reshape(Z // factor, factor, Y // factor, factor, X // factor, factor).mean(axis=(1, 3, 5))
