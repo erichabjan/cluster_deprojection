@@ -463,7 +463,7 @@ def build_one_sample(args) -> Dict:
     mask[:n_keep] = 1.0
 
     # -------------------------------
-    # Weak-lensing source-galaxy point cloud (same viewing frame)
+    # Weak-lensing source-galaxy point cloud
     # -------------------------------
     S = CFG_LENS.shape_grid_size
     sigma = build_sigma_2d(components, fov, S)

@@ -11,15 +11,19 @@ from train_conditional_diffusion import preload_hdf5_to_memory, train_model
 
 
 def main():
-    data_path = "/projects/mccleary_group/habjan.e/TNG/Data/conditional_diffusion_data/"
-    train_file = "cond_diffusion_16cubed_16img_train.h5"
-    test_file = "cond_diffusion_16cubed_16img_test.h5"
+    data_path = "/projects/mccleary_group/habjan.e/TNG/Data/shape_dynamics/"
+    train_file = "shape_dynamics_train.h5"
+    test_file = "shape_dynamics_val.h5"
 
     train_path = os.path.join(data_path, train_file)
     test_path = os.path.join(data_path, test_file)
 
     train_data = preload_hdf5_to_memory(train_path)
     test_data = preload_hdf5_to_memory(test_path)
+
+    # Length of the per-source-galaxy embedding produced by the shape MLP
+    # (the "C" of the latent 128x128x(C+1) shear cube).
+    src_embed_dim = 32
 
     cfg = DiffusionModelConfig(
         base_channels=32,
@@ -29,6 +33,9 @@ def main():
         galaxy_token_dim=128,
         num_attention_heads=4,
         coord_image_size=16,
+        src_embed_dim=src_embed_dim,
+        src_out_ch=32,
+        shape_grid_size=int(train_data["metadata"]["shape_grid_size"]),
     )
 
     model = ConditionalUNet3D(cfg=cfg)
@@ -50,14 +57,16 @@ def main():
     beta_start = 1e-4
     beta_end = 2e-2
 
-    suffix = "_16cube_16img_v9"
+    suffix = "_shape_dyn_v1"
 
     wandb_notes = (
-        "Conditional 3D diffusion model. "
-        "16^3 cube with 16x16 images. "
-        "Galaxy token cross attention and image conditioning. "
-        "Uniform MSE loss (no floor weighting). "
-        "Testing cross-attention at reduced resolution."
+        "Conditional 3D diffusion model on the shape_dynamics dataset. "
+        "16^3 cube with 16x16 dynamics images (gal_xy, vz, vz_disp). "
+        "Weak-lensing source-galaxy point cloud replaces the projected mass "
+        "map: per-source MLP embedding, mean-pooled per 128x128 cell, "
+        "+log1p(count) channel, stride-2 convs to 16x16, concatenated onto "
+        "the conditioning images. Galaxy token cross attention unchanged. "
+        "Uniform MSE loss (no floor weighting)."
     )
 
     cfg_dict = dict(
@@ -68,10 +77,14 @@ def main():
         galaxy_token_dim=int(cfg.galaxy_token_dim),
         num_attention_heads=int(cfg.num_attention_heads),
         coord_image_size=int(cfg.coord_image_size),
+        src_embed_dim=int(cfg.src_embed_dim),
+        src_out_ch=int(cfg.src_out_ch),
+        shape_grid_size=int(cfg.shape_grid_size),
         image_storage="(S,C,H,W) in HDF5; transposed to (B,H,W,C) in loader",
         cube_storage="(S,Z,Y,X) in HDF5; expanded to (B,Z,Y,X,1) in loader",
         gal_feature_columns="(x, y, vz, Ngal)",
         gal_pixel_coord_columns="(x_pix, y_pix)",
+        src_feature_columns="(e1, e2, ix, iy, z_s, z_lens, cell_frac)",
     )
 
     trained_state, train_losses, test_losses, diffusion_cfg = train_model(

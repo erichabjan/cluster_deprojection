@@ -240,6 +240,83 @@ class GalaxyTokenEncoder(nn.Module):
         return x
 
 
+class SourceShapeEncoder(nn.Module):
+    """
+    Weak-lensing source-galaxy branch (replaces the projected mass image).
+
+    Per-galaxy MLP embedding of the 7 source features -> mean-pooled per cell
+    of the (grid_size x grid_size) shape grid via segment ops (rows arrive
+    pre-sorted by cell id from the dataset) -> concat a log1p(count) channel
+    -> stride-2 conv stages down to (target_size x target_size, out_ch).
+
+    Padded galaxies must carry cell id = grid_size**2; they land in a dummy
+    segment that is dropped, so no separate validity mask is needed.
+    """
+    embed_dim: int          # per-galaxy embedding length (cfg.src_embed_dim)
+    out_ch: int             # channels of the reduced feature map
+    grid_size: int          # S: shape grid resolution (cfg.shape_grid_size)
+    target_size: int        # output resolution, matches the conditioning images
+    activation: Callable = nn.gelu
+
+    @nn.compact
+    def __call__(
+        self,
+        src_features: jnp.ndarray,
+        src_cell_id: jnp.ndarray,
+        src_log_count: jnp.ndarray,
+    ) -> jnp.ndarray:
+        """
+        src_features:  (B, N, 7)  e1, e2, ix, iy, z_s, z_lens, cell_frac (raw)
+        src_cell_id:   (B, N)     int32, iy*S + ix; padded rows = S*S
+        src_log_count: (B, S, S, 1)  log1p(sources per cell)
+
+        returns: (B, target_size, target_size, out_ch)
+        """
+        B, N, _ = src_features.shape
+        S = self.grid_size
+        n_seg = S * S + 1  # + dummy segment for padded rows
+
+        # Fixed rescaling so all inputs are O(1): cell coords -> [-1, 1],
+        # cell_frac -> ~1 for a uniform field (raw values are ~1/S^2).
+        f = src_features
+        x_in = jnp.stack([
+            f[..., 0],                                     # e1
+            f[..., 1],                                     # e2
+            (f[..., 2] + 0.5) / S * 2.0 - 1.0,             # ix -> [-1, 1]
+            (f[..., 3] + 0.5) / S * 2.0 - 1.0,             # iy -> [-1, 1]
+            f[..., 4],                                     # z_s
+            f[..., 5],                                     # z_lens
+            f[..., 6] * float(S * S),                      # cell_frac
+        ], axis=-1)
+
+        emb = MLP([2 * self.embed_dim, self.embed_dim], activate_last=True)(x_in)  # (B,N,E)
+
+        def cell_mean(e, cid):
+            sums = jax.ops.segment_sum(
+                e, cid, num_segments=n_seg, indices_are_sorted=True)
+            cnts = jax.ops.segment_sum(
+                jnp.ones((e.shape[0],), e.dtype), cid,
+                num_segments=n_seg, indices_are_sorted=True)
+            return sums[:-1] / jnp.maximum(cnts[:-1], 1.0)[:, None]  # drop dummy
+
+        h = jax.vmap(cell_mean)(emb, src_cell_id)          # (B, S*S, E)
+        h = h.reshape(B, S, S, self.embed_dim)             # [iy, ix] = (H, W)
+        h = jnp.concatenate([h, src_log_count], axis=-1)   # (B, S, S, E+1)
+
+        size = S
+        assert size % self.target_size == 0, \
+            f"shape grid {S} not reducible to {self.target_size} by stride-2 convs"
+        while size > self.target_size:
+            h = nn.Conv(self.out_ch, kernel_size=(3, 3), strides=(2, 2), padding="SAME")(h)
+            h = nn.GroupNorm(num_groups=min(8, self.out_ch))(h)
+            h = self.activation(h)
+            size //= 2
+
+        h = nn.Conv(self.out_ch, kernel_size=(3, 3), padding="SAME")(h)
+        h = self.activation(h)
+        return h
+
+
 class QueryCrossAttention3D(nn.Module):
     query_dim: int
     num_heads: int
@@ -359,6 +436,11 @@ class DiffusionModelConfig:
     # Use 16 for your new low-resolution dataset, 64 for the old one.
     coord_image_size: int = 16
 
+    # Weak-lensing source-galaxy branch (shape_dynamics dataset)
+    src_embed_dim: int = 32       # per-source-galaxy embedding length
+    src_out_ch: int = 32          # channels of the reduced shear feature map
+    shape_grid_size: int = 128    # S: source cell grid (h5 attr 'shape_grid_size')
+
 
 class ConditionalUNet3D(nn.Module):
     cfg: DiffusionModelConfig
@@ -372,14 +454,20 @@ class ConditionalUNet3D(nn.Module):
         gal_features: jnp.ndarray,
         gal_pixel_coords: jnp.ndarray,
         gal_mask: jnp.ndarray,
+        src_features: jnp.ndarray,
+        src_cell_id: jnp.ndarray,
+        src_log_count: jnp.ndarray,
     ) -> jnp.ndarray:
         """
         noisy_cube:       (B, Z, Y, X, 1)      e.g. (B,16,16,16,1)
         timesteps:        (B,)
-        cond_images:      (B, H, W, 4)         e.g. (B,16,16,4)
+        cond_images:      (B, H, W, C)         e.g. (B,16,16,3)
         gal_features:     (B, N, Fg)           e.g. [x, y, vz, Ngal]
         gal_pixel_coords: (B, N, 2)
         gal_mask:         (B, N)
+        src_features:     (B, Ns, 7)           e1, e2, ix, iy, z_s, z_lens, cell_frac
+        src_cell_id:      (B, Ns)              int32; padded rows = shape_grid_size**2
+        src_log_count:    (B, S, S, 1)         log1p(sources per shape-grid cell)
         """
         time_emb = sinusoidal_time_embedding(timesteps, self.cfg.time_emb_dim)
         time_emb = MLP(
@@ -388,6 +476,19 @@ class ConditionalUNet3D(nn.Module):
         )(time_emb)
 
         chs = [self.cfg.base_channels * m for m in self.cfg.channel_mults]
+
+        # ------------------------------------------------------------
+        # Weak-lensing source-galaxy branch -> 2D feature map fused
+        # channel-wise into the conditioning images (the slot the projected
+        # mass map used to occupy)
+        # ------------------------------------------------------------
+        shear2d = SourceShapeEncoder(
+            embed_dim=self.cfg.src_embed_dim,
+            out_ch=self.cfg.src_out_ch,
+            grid_size=self.cfg.shape_grid_size,
+            target_size=cond_images.shape[1],
+        )(src_features, src_cell_id, src_log_count)     # (B,H,W,src_out_ch)
+        cond_images = jnp.concatenate([cond_images, shear2d], axis=-1)
 
         # ------------------------------------------------------------
         # 2D image branch

@@ -16,54 +16,143 @@ import wandb
 
 
 def preload_hdf5_to_memory(file_path: str) -> Dict[str, np.ndarray]:
+    """
+    Load a full dataset file into memory.
+
+    Fixed-shape data (images, cubes, member point cloud, targets) are stacked
+    into dense (n_samples, ...) arrays. The weak-lensing source point clouds
+    from the shape_dynamics files are RAGGED (variable N per sample) and are
+    returned as lists of arrays:
+      src_features [i]: (N_i, 7) float32  e1, e2, ix, iy, z_s, z_lens, cell_frac
+      src_cell_id  [i]: (N_i,)   int32    iy*S + ix, rows pre-sorted by this
+      src_cell_ptr     : (n_samples, S*S+1) int32 CSR pointers; sample i's
+                         cell c holds src_features[i][ptr[i,c]:ptr[i,c+1]]
+    with S = metadata["shape_grid_size"]. Old h5 files without source data
+    load fine; the src_* / z_lens / n_sources keys are simply absent.
+    """
     print(f"\nPreloading {file_path} into memory...")
     start = time.time()
 
     with h5py.File(file_path, "r") as f:
-        sample_ids = list(f.keys())
+        sample_ids = sorted(f.keys())
         n_samples = len(sample_ids)
         first = f[sample_ids[0]]
 
-        images_shape = first["images"].shape
-        cube_shape = first["density_cube"].shape
-        feat_shape = first["gal_features"].shape
-        pix_shape = first["gal_pixel_coords"].shape
-        mask_shape = first["mask"].shape
+        images = np.zeros((n_samples, *first["images"].shape), dtype=np.float32)
+        cubes = np.zeros((n_samples, *first["density_cube"].shape), dtype=np.float32)
+        gal_features = np.zeros((n_samples, *first["gal_features"].shape), dtype=np.float32)
+        gal_targets = np.zeros((n_samples, *first["gal_targets"].shape), dtype=np.float32)
+        gal_pixel_coords = np.zeros((n_samples, *first["gal_pixel_coords"].shape), dtype=np.float32)
+        mask = np.zeros((n_samples, *first["mask"].shape), dtype=np.float32)
+        globals_target = np.zeros((n_samples, *first["globals_target"].shape), dtype=np.float32)
 
-        images = np.zeros((n_samples, *images_shape), dtype=np.float32)
-        cubes = np.zeros((n_samples, *cube_shape), dtype=np.float32)
-        gal_features = np.zeros((n_samples, *feat_shape), dtype=np.float32)
-        gal_pixel_coords = np.zeros((n_samples, *pix_shape), dtype=np.float32)
-        mask = np.zeros((n_samples, *mask_shape), dtype=np.float32)
+        cluster_index = np.zeros((n_samples,), dtype=np.int32)
+        simulation = []
+
+        has_src = "src_features" in first
+        if has_src:
+            src_features = []
+            src_cell_id = []
+            src_cell_ptr = np.zeros((n_samples, *first["src_cell_ptr"].shape), dtype=np.int32)
+            z_lens = np.zeros((n_samples,), dtype=np.float32)
+            n_sources = np.zeros((n_samples,), dtype=np.int64)
 
         for i, sid in enumerate(sample_ids):
             g = f[sid]
             images[i] = g["images"][:]
             cubes[i] = g["density_cube"][:]
             gal_features[i] = g["gal_features"][:]
+            gal_targets[i] = g["gal_targets"][:]
             gal_pixel_coords[i] = g["gal_pixel_coords"][:]
             mask[i] = g["mask"][:]
+            globals_target[i] = g["globals_target"][:]
+            cluster_index[i] = g.attrs["cluster_index"]
+            simulation.append(str(g.attrs["simulation"]))
+            if has_src:
+                src_features.append(g["src_features"][:])
+                src_cell_id.append(g["src_cell_id"][:])
+                src_cell_ptr[i] = g["src_cell_ptr"][:]
+                z_lens[i] = g.attrs["z_lens"]
+                n_sources[i] = g.attrs["n_sources"]
 
         metadata = {k: f.attrs[k] for k in f.attrs.keys()}
 
     elapsed = time.time() - start
-    size_gb = (
+    size_b = (
         images.nbytes
         + cubes.nbytes
         + gal_features.nbytes
+        + gal_targets.nbytes
         + gal_pixel_coords.nbytes
         + mask.nbytes
-    ) / 1e9
-    print(f"✓ Loaded {n_samples} samples in {elapsed:.2f}s ({size_gb:.2f} GB)")
+        + globals_target.nbytes
+    )
+    if has_src:
+        size_b += (sum(a.nbytes for a in src_features)
+                   + sum(a.nbytes for a in src_cell_id)
+                   + src_cell_ptr.nbytes)
+    print(f"✓ Loaded {n_samples} samples in {elapsed:.2f}s ({size_b / 1e9:.2f} GB)")
+    if has_src:
+        print(f"  sources/sample: min={n_sources.min()}, "
+              f"median={int(np.median(n_sources))}, max={n_sources.max()}; "
+              f"shape grid {int(metadata['shape_grid_size'])}"
+              f"x{int(metadata['shape_grid_size'])}")
 
-    return dict(
+    out = dict(
         images=images,
         cubes=cubes,
         gal_features=gal_features,
+        gal_targets=gal_targets,
         gal_pixel_coords=gal_pixel_coords,
         mask=mask,
+        globals_target=globals_target,
+        cluster_index=cluster_index,
+        simulation=np.array(simulation),
         metadata=metadata,
     )
+    if has_src:
+        out.update(
+            src_features=src_features,
+            src_cell_id=src_cell_id,
+            src_cell_ptr=src_cell_ptr,
+            z_lens=z_lens,
+            n_sources=n_sources,
+        )
+    return out
+
+
+def make_src_batch(
+    data: Dict[str, np.ndarray],
+    bidx: np.ndarray,
+    n_src_pad: int,
+    grid_size: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Assemble the ragged source point clouds of one batch into fixed-shape
+    arrays for jit:
+      src_features (B, n_src_pad, 7) zero-padded
+      src_cell_id  (B, n_src_pad)    padded rows get the dummy cell S*S,
+                                     which SourceShapeEncoder drops
+      src_log_count(B, S, S, 1)      log1p(sources per cell), from cell_ptr
+    """
+    B = len(bidx)
+    S = grid_size
+    feats = np.zeros((B, n_src_pad, 7), dtype=np.float32)
+    cids = np.full((B, n_src_pad), S * S, dtype=np.int32)
+    logc = np.zeros((B, S, S, 1), dtype=np.float32)
+    for j, i in enumerate(bidx):
+        f = data["src_features"][i]
+        n = f.shape[0]
+        if n > n_src_pad:
+            raise ValueError(
+                f"sample {i} has {n} sources > n_src_pad={n_src_pad}; "
+                "recompute n_src_pad as the max over all splits"
+            )
+        feats[j, :n] = f
+        cids[j, :n] = data["src_cell_id"][i]
+        counts = np.diff(data["src_cell_ptr"][i]).reshape(S, S)
+        logc[j, ..., 0] = np.log1p(counts)
+    return feats, cids, logc
 
 
 def data_loader(
@@ -71,11 +160,20 @@ def data_loader(
     batch_size: int,
     rng: np.random.Generator,
     shuffle: bool = True,
-) -> Iterator[Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]]:
+    n_src_pad: Optional[int] = None,
+    grid_size: Optional[int] = None,
+) -> Iterator[Tuple[jnp.ndarray, ...]]:
     n = data["images"].shape[0]
     idx = np.arange(n)
     if shuffle:
         rng.shuffle(idx)
+
+    # Padded source-cloud size / shape grid; pass shared values across splits
+    # so train and eval batches have identical shapes (single jit compile).
+    if n_src_pad is None:
+        n_src_pad = int(np.max(data["n_sources"]))
+    if grid_size is None:
+        grid_size = int(data["metadata"]["shape_grid_size"])
 
     for i in range(0, n, batch_size):
         bidx = idx[i:i + batch_size]
@@ -92,18 +190,26 @@ def data_loader(
         gal_pixel_coords = data["gal_pixel_coords"][bidx]# (B,N,2)
         mask = data["mask"][bidx]                        # (B,N)
 
+        src_features, src_cell_id, src_log_count = make_src_batch(
+            data, bidx, n_src_pad, grid_size)
+
         yield (
             jnp.asarray(images),
             jnp.asarray(cubes),
             jnp.asarray(gal_features),
             jnp.asarray(gal_pixel_coords),
             jnp.asarray(mask),
+            jnp.asarray(src_features),
+            jnp.asarray(src_cell_id),
+            jnp.asarray(src_log_count),
         )
 
 
-def infinite_data_loader(data, batch_size, rng, shuffle=True):
+def infinite_data_loader(data, batch_size, rng, shuffle=True,
+                         n_src_pad=None, grid_size=None):
     while True:
-        yield from data_loader(data, batch_size=batch_size, rng=rng, shuffle=shuffle)
+        yield from data_loader(data, batch_size=batch_size, rng=rng, shuffle=shuffle,
+                               n_src_pad=n_src_pad, grid_size=grid_size)
 
 
 def make_beta_schedule(T: int, beta_start: float = 1e-4, beta_end: float = 2e-2):
@@ -121,7 +227,8 @@ def q_sample(x0, t, noise, alpha_bars):
 
 
 def create_train_state(model, rng_key, learning_rate, grad_clipping, example_batch):
-    images_ex, cubes_ex, gal_features_ex, gal_pixel_coords_ex, mask_ex = example_batch
+    (images_ex, cubes_ex, gal_features_ex, gal_pixel_coords_ex, mask_ex,
+     src_features_ex, src_cell_id_ex, src_log_count_ex) = example_batch
     B = cubes_ex.shape[0]
     t_ex = jnp.zeros((B,), dtype=jnp.int32)
 
@@ -133,6 +240,9 @@ def create_train_state(model, rng_key, learning_rate, grad_clipping, example_bat
         gal_features=gal_features_ex,
         gal_pixel_coords=gal_pixel_coords_ex,
         gal_mask=mask_ex,
+        src_features=src_features_ex,
+        src_cell_id=src_cell_id_ex,
+        src_log_count=src_log_count_ex,
     )["params"]
 
     tx = optax.chain(
@@ -150,6 +260,9 @@ def diffusion_loss(
     gal_features,
     gal_pixel_coords,
     mask,
+    src_features,
+    src_cell_id,
+    src_log_count,
     timesteps,
     noise,
     alpha_bars,
@@ -166,6 +279,9 @@ def diffusion_loss(
         gal_features=gal_features,
         gal_pixel_coords=gal_pixel_coords,
         gal_mask=mask,
+        src_features=src_features,
+        src_cell_id=src_cell_id,
+        src_log_count=src_log_count,
     )
     #weights = jnp.where(cubes <= floor_value + 1e-6, bg_weight, fg_weight)
     #sqerr = (pred_noise - noise) ** 2
@@ -174,7 +290,9 @@ def diffusion_loss(
 
 
 @jax.jit
-def train_step(state, images, cubes, gal_features, gal_pixel_coords, mask, rng_key, alpha_bars, num_timesteps):
+def train_step(state, images, cubes, gal_features, gal_pixel_coords, mask,
+               src_features, src_cell_id, src_log_count,
+               rng_key, alpha_bars, num_timesteps):
     rng_t, rng_n = jax.random.split(rng_key, 2)
     B = cubes.shape[0]
     t = jax.random.randint(rng_t, shape=(B,), minval=0, maxval=num_timesteps)
@@ -189,6 +307,9 @@ def train_step(state, images, cubes, gal_features, gal_pixel_coords, mask, rng_k
             gal_features,
             gal_pixel_coords,
             mask,
+            src_features,
+            src_cell_id,
+            src_log_count,
             t,
             noise,
             alpha_bars,
@@ -201,7 +322,9 @@ def train_step(state, images, cubes, gal_features, gal_pixel_coords, mask, rng_k
 
 
 @jax.jit
-def eval_step(state, images, cubes, gal_features, gal_pixel_coords, mask, rng_key, alpha_bars, num_timesteps):
+def eval_step(state, images, cubes, gal_features, gal_pixel_coords, mask,
+              src_features, src_cell_id, src_log_count,
+              rng_key, alpha_bars, num_timesteps):
     rng_t, rng_n = jax.random.split(rng_key, 2)
     B = cubes.shape[0]
     t = jax.random.randint(rng_t, shape=(B,), minval=0, maxval=num_timesteps)
@@ -215,6 +338,9 @@ def eval_step(state, images, cubes, gal_features, gal_pixel_coords, mask, rng_ke
         gal_features,
         gal_pixel_coords,
         mask,
+        src_features,
+        src_cell_id,
+        src_log_count,
         t,
         noise,
         alpha_bars,
@@ -228,6 +354,9 @@ def sample_ddpm(
     gal_features,
     gal_pixel_coords,
     mask,
+    src_features,
+    src_cell_id,
+    src_log_count,
     sample_shape,
     rng_key,
     betas,
@@ -239,6 +368,9 @@ def sample_ddpm(
     gal_features:     (B,N,4)
     gal_pixel_coords: (B,N,2)
     mask:             (B,N)
+    src_features:     (B,Ns,7)
+    src_cell_id:      (B,Ns)
+    src_log_count:    (B,S,S,1)
     sample_shape:     (B,Z,Y,X,1)
     """
     x = jax.random.normal(rng_key, shape=sample_shape)
@@ -255,6 +387,9 @@ def sample_ddpm(
             gal_features=gal_features,
             gal_pixel_coords=gal_pixel_coords,
             gal_mask=mask,
+            src_features=src_features,
+            src_cell_id=src_cell_id,
+            src_log_count=src_log_count,
         )
 
         beta_t = betas[step]
@@ -320,13 +455,22 @@ def train_model(
         beta_end=beta_end,
     )
 
-    train_stream = infinite_data_loader(train_data, batch_size, rng=train_rng, shuffle=True)
+    # Shared padded source-cloud size across train and eval so every batch has
+    # identical shapes (one jit compile of each step function).
+    n_src_pad = int(max(np.max(train_data["n_sources"]), np.max(test_data["n_sources"])))
+    grid_size = int(train_data["metadata"]["shape_grid_size"])
+    print(f"source clouds padded to n_src_pad={n_src_pad}, shape grid {grid_size}x{grid_size}")
+
+    train_stream = infinite_data_loader(train_data, batch_size, rng=train_rng, shuffle=True,
+                                        n_src_pad=n_src_pad, grid_size=grid_size)
     example_batch = next(
         data_loader(
             train_data,
             batch_size=min(batch_size, 2),
             rng=train_rng,
             shuffle=False,
+            n_src_pad=n_src_pad,
+            grid_size=grid_size,
         )
     )
 
@@ -385,13 +529,14 @@ def train_model(
     def eval_loop():
         total = 0.0
         count = 0
-        it = data_loader(test_data, batch_size=batch_size, rng=test_rng, shuffle=True)
+        it = data_loader(test_data, batch_size=batch_size, rng=test_rng, shuffle=True,
+                         n_src_pad=n_src_pad, grid_size=grid_size)
 
         if num_eval_batches is None:
-            for images, cubes, gal_features, gal_pixel_coords, mask in it:
+            for batch in it:
                 nonlocal_rng = jax.random.PRNGKey(1000 + count)
                 loss = eval_step(
-                    state, images, cubes, gal_features, gal_pixel_coords, mask,
+                    state, *batch,
                     nonlocal_rng, alpha_bars, num_diffusion_steps
                 )
                 total += float(loss)
@@ -399,12 +544,12 @@ def train_model(
         else:
             for k in range(num_eval_batches):
                 try:
-                    images, cubes, gal_features, gal_pixel_coords, mask = next(it)
+                    batch = next(it)
                 except StopIteration:
                     break
                 nonlocal_rng = jax.random.PRNGKey(1000 + k)
                 loss = eval_step(
-                    state, images, cubes, gal_features, gal_pixel_coords, mask,
+                    state, *batch,
                     nonlocal_rng, alpha_bars, num_diffusion_steps
                 )
                 total += float(loss)
@@ -420,16 +565,12 @@ def train_model(
     buffer_seconds = runtime_buffer_minutes * 60.0
 
     for step in range(1, num_train_steps + 1):
-        images, cubes, gal_features, gal_pixel_coords, mask = next(train_stream)
+        batch = next(train_stream)
         rng_key, step_key = jax.random.split(rng_key)
 
         state, loss_train = train_step(
             state,
-            images,
-            cubes,
-            gal_features,
-            gal_pixel_coords,
-            mask,
+            *batch,
             step_key,
             alpha_bars,
             num_diffusion_steps,
