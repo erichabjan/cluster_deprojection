@@ -35,7 +35,7 @@ SUFFIX = "_shape_dyn_v1"
 
 VAL_PATH = "/projects/mccleary_group/habjan.e/TNG/Data/shape_dynamics/shape_dynamics_val.h5"
 MODEL_DIR = "/home/habjan.e/TNG/cluster_deprojection/conditional_diffusion_model/conditional_diffusion_models"
-OUT_DIR = "/projects/mccleary_group/habjan.e/TNG/Data/shape_dynamics/cd_posterior"
+OUT_DIR = "/scratch/habjan.e/conditional_diffusion/posterior_sampling" #"/projects/mccleary_group/habjan.e/TNG/Data/shape_dynamics/cd_posterior"
 
 NUM_EXAMPLES = 50            # random validation examples to sample
 N_POSTERIOR_SAMPLES = 200    # independent posterior draws per example
@@ -44,8 +44,10 @@ BASE_SAMPLE_SEED = 0         # PRNG base for the diffusion noise draws
 
 # Number of (example, draw) slots per GPU launch. Larger = better GPU
 # utilization; the ceiling is device memory used by the padded source clouds
-# (~250-400 MB per slot at n_pad ~ 5e5). Drop this if you hit OOM.
-SAMPLING_BATCH_SIZE = 128
+# (~250-300 MB per slot at n_pad ~ 5e5). 64 fits a 40 GB A100; 128 needs an
+# 80 GB card (add `#SBATCH --constraint=a100@80g` to the slurm file to pin
+# one). Drop this if you hit OOM.
+SAMPLING_BATCH_SIZE = 64
 
 # Padded source-cloud length. None -> max n_sources over the SELECTED
 # examples (recommended). Set manually to trade memory for batch size; must

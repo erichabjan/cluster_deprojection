@@ -82,7 +82,7 @@ def main():
         shape_grid_size=int(cfg.shape_grid_size),
         image_storage="(S,C,H,W) in HDF5; transposed to (B,H,W,C) in loader",
         cube_storage="(S,Z,Y,X) in HDF5; expanded to (B,Z,Y,X,1) in loader",
-        gal_feature_columns="(x, y, vz, Ngal)",
+        gal_feature_columns="(x, y, z_gal, Ngal)",
         gal_pixel_coord_columns="(x_pix, y_pix)",
         src_feature_columns="(e1, e2, ix, iy, z_s, z_lens, cell_frac)",
     )
