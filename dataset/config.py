@@ -9,8 +9,11 @@ Merges the pieces of jaxlense_dataset/config.py and
 conditional_diffusion_model/conditional_diffusion_data.py that this
 pipeline actually uses.
 """
+import zlib
 from dataclasses import dataclass
 from typing import Tuple
+
+import numpy as np
 
 
 # Empirical source-redshift templates, selectable via
@@ -62,6 +65,28 @@ class LensingConfig:
     # [z_lens_min, z_lens_max] for the lensing geometry.
     z_lens_min: float = 0.03
     z_lens_max: float = 0.12
+    # z_lens is the one random draw two separate slurm stages have to agree on:
+    # xray_photons.py generates a photon list at each sample's z_lens, and
+    # build_bahamas_dataset.py reads it back. It is therefore NOT taken from the
+    # build's job-order rng stream (which would depend on the simulation list,
+    # the cluster range and the loop order) but from sample_z_lens() below,
+    # keyed only on (simulation, cluster, projection). Change this seed and
+    # every photon list has to be regenerated.
+    z_lens_seed: int = 20260907
+
+    # --- photometric-redshift error (LoVoCCS II / III BPZ) ------------------
+    # The empirical template *is* the observed BPZ point-estimate distribution
+    # (real LoVoCCS z_b values), so a source's drawn z is what an observer
+    # measures; the truth scatters about it. LoVoCCS III quotes
+    # sigma_z/(1+z) ~ 0.051 with an outlier rate eta ~ 5.3%.
+    #
+    # Caveat, stated where it matters in draw_shape_catalog: 0.051 is the
+    # scatter of z_phot about z_spec, so strictly it belongs to p(z_phot|z_true)
+    # rather than p(z_true|z_phot). Inverting needs the true n(z) as a prior;
+    # applying it symmetrically is the usual mock-catalog approximation.
+    bpz_sigma_z: float = 0.051           # per (1 + z)
+    bpz_outlier_rate: float = 0.053      # redrawn from the full n(z)
+    apply_photoz_error: bool = True
     # LoVoCCS II (Fu+ 2024, arXiv:2402.10337): ~7 arcmin^-2 after photo-z cuts.
     n_source_per_arcmin2: float = 7.0
     # LoVoCCS section 5.3: per-component shape dispersion ~0.4, against DES Y3's
@@ -78,6 +103,14 @@ class LensingConfig:
     # Which empirical n(z) to draw source redshifts from; one of
     # EMPIRICAL_REDSHIFT_TEMPLATES ('SuperBIT' or 'LoVoCCS').
     empirical_template: str = "LoVoCCS"
+    # LoVoCCS II's background-galaxy selection, applied to the BPZ point
+    # estimate: a foreground cut at (cluster redshift + 0.1) and a high-z cut at
+    # 1.4. Both are per sample, since the first depends on z_lens, and both are
+    # applied to the *template* before drawing rather than to the drawn catalog,
+    # so the surviving density is still n_source_per_arcmin2 -- LoVoCCS's
+    # ~7 arcmin^-2 is itself quoted after these cuts.
+    src_z_foreground_pad: float = 0.10
+    src_z_max: float = 1.40
     # Resolved from empirical_template in __post_init__ when left empty;
     # set both explicitly to point at a custom npz instead.
     empirical_redshift_npz_path: str = ""
@@ -142,15 +175,21 @@ class XrayConfig:
     under scratch_dir; the dataset build only reads those back.
     """
     enabled: bool = True
-    scratch_dir: str = "/scratch/habjan.e/xray_intermediates"
-    # Photon lists: written once per (sim, cluster, z bin) by xray_photons.py and
-    # read back by every sample of that cluster, so they persist for the whole
-    # dataset build rather than being cleaned up per sample.
-    photon_dir: str = "/scratch/habjan.e/xray_intermediates/photons"
-    # Per-sample SOXS/pyXSIM products, deleted once the maps are extracted.
+    # Photon lists: written once per (sim, cluster, projection) by
+    # xray_photons.py and read back by the matching sample of the dataset build.
+    # They are the expensive product of stage 1 -- hours of pyXSIM per cluster --
+    # so they live on /projects rather than /scratch, which is subject to
+    # purging, and are laid out one subdirectory per dark-matter model:
+    #   <photon_dir>/<sim>/<sim>_GrNm_<cluster>_p<projection>_photons.h5
+    photon_dir: str = "/projects/mccleary_group/habjan.e/TNG/Data/xray_list_files/BAHAMAS"
+    # Scratch. Everything below is regenerable and gets deleted, so it stays on
+    # the fast local filesystem.
+    #   photon_work_dir : per-array-task cwd for stage 1, since pyXSIM writes
+    #                     some intermediates relative to the working directory
+    #   work_dir        : per-sample SOXS/pyXSIM products for stage 2, removed
+    #                     once the maps are extracted
+    photon_work_dir: str = "/scratch/habjan.e/xray_intermediates/photon_work"
     work_dir: str = "/scratch/habjan.e/xray_intermediates/work"
-    # Keep the full FITS/HDF5 intermediates for the first N samples only.
-    keep_intermediates: int = 0
 
     # --- gas selection (notebook cells 12/16) -------------------------------
     n_R200: float = 2.0                  # load gas within this many R200 of the BCG
@@ -170,35 +209,73 @@ class XrayConfig:
     nH_gal: float = 0.03                 # 1e22 cm^-2 Galactic column
     absorb_model: str = "wabs"
     sky_center: Tuple[float, float] = (240.57, 15.97)   # Abell 2147, deg
-    # Photon lists are expensive and bake in the redshift, so they are generated
-    # per z bin of this width over [z_lens_min, z_lens_max] and reused across a
-    # cluster's projections; the lensing geometry keeps the exact z_lens.
-    z_bin_width: float = 0.01
+    # One photon list per *sample*, at that sample's exact z_lens
+    # (config.sample_z_lens), rather than per redshift bin. Binning was the
+    # cheaper option only in the abstract: n_projections = 5 lists per cluster
+    # is fewer than the 9 bins the old 0.01-wide binning over [0.03, 0.12]
+    # needed, and it removes the up-to-14% angular-scale mismatch a bin centre
+    # left between a sample's X-ray map and its lensing geometry.
 
-    # --- the observation (notebook cells 38/42) -----------------------------
+    # --- the observation ----------------------------------------------------
+    # LoVoCCS's X-ray coverage is *archival* Chandra/XMM (LoVoCCS III), not a
+    # uniform designed survey: a nearby cluster typically has a single ACIS
+    # pointing of a few tens of ks, not a deep mosaic. So one pointing, with the
+    # exposure drawn per sample from the archival-like distribution below.
     instrument: str = "chandra_acisi_cy22"
-    n_side: int = 3                      # 3x3 mosaic
-    step_arcmin: float = 16.0            # < the 20' FOV, so pointings overlap
-    t_exp_ks: float = 20.0               # per pointing
+    n_side: int = 1                      # single pointing (was a 3x3 mosaic)
+    step_arcmin: float = 16.0            # unused at n_side = 1; kept for mosaics
     band_emin_kev: float = 0.5
     band_emax_kev: float = 2.0
-    reblock: int = 4                     # 2" mosaic pixels
+    reblock: int = 4                     # 2" detector pixels
     instr_bkgnd: bool = True
     foreground: bool = True
     ptsrc_bkgnd: bool = True
 
+    # Per-sample exposure, lognormal about t_exp_median_ks and clipped to the
+    # range. Typical archival ACIS exposures of nearby X-ray-luminous clusters
+    # run from ~10 ks snapshots to ~100 ks pointed observations.
+    #
+    # The cap is not free: a pointing can only be as deep as the photon list it
+    # samples, which needs sample_exp_ks * sample_area_cm2 >= t_exp * A_eff_peak.
+    # With 60 ks x 1000 cm^2 against ACIS-I's 429 cm^2 peak ARF that allows
+    # ~140 ks, so t_exp_max_ks = 100 leaves ~40% headroom.
+    t_exp_median_ks: float = 30.0
+    t_exp_sigma_ln: float = 0.6
+    t_exp_min_ks: float = 10.0
+    t_exp_max_ks: float = 100.0
+
     # --- the stored maps ----------------------------------------------------
-    # Fixed angular grid: the mosaic footprint is (n_side-1)*step + instrument
-    # FOV = 52' across, so the physical scale varies with the sample's redshift
-    # and is written per sample as xray_mpc_per_pix.
+    # Fixed *angular* grid, so a cluster's physical size varies with the
+    # sample's redshift while the image shape does not; the scale is written per
+    # sample as xray_mpc_per_pix. 20.008' is the ACIS-I field in SOXS's
+    # instrument registry, so one pointing fills the frame.
     grid_size: int = 128
-    fov_arcmin: float = 52.0
+    fov_arcmin: float = 20.0
+
+    # --- intrinsic X-ray luminosity (diagnostic, never a cut) ---------------
+    # LoVoCCS selects on L_X500c > 1e44 erg/s in 0.1-2.4 keV. The BAHAMAS sample
+    # is mass-selected, so L_X500c is recorded per cluster to let that selection
+    # be checked after the fact. No simulated cluster is dropped on it.
+    lx_band_kev: Tuple[float, float] = (0.1, 2.4)
+    lx_nbins: int = 4000
+    lx_T_grid_min_K: float = 1.0e6       # matches T_min_K; Lambda = 0 below
+    lx_T_grid_max_K: float = 1.0e9
+    lx_T_grid_n: int = 300
 
     def pointing_offsets_deg(self):
-        """Mosaic pointing offsets from sky_center, in degrees, as (dx, dy)."""
+        """Pointing offsets from sky_center, in degrees, as (dx, dy)."""
         import numpy as _np
         off = (_np.arange(self.n_side) - 0.5 * (self.n_side - 1)) * self.step_arcmin / 60.0
         return [(ddx, ddy) for ddy in off for ddx in off]
+
+    def draw_exposure_ks(self, rng):
+        """Per-sample ACIS exposure, in ks."""
+        import numpy as _np
+        t = float(rng.lognormal(_np.log(self.t_exp_median_ks), self.t_exp_sigma_ln))
+        return float(_np.clip(t, self.t_exp_min_ks, self.t_exp_max_ks))
+
+    # The redshift each photon list is generated at lives in config.sample_z_lens,
+    # so the photon stage and the dataset build cannot drift.
 
     # The redshift bins themselves live in xray_utils (z_bin_centers,
     # nearest_z_bin), so the photon stage and the dataset build cannot drift.
@@ -236,6 +313,34 @@ CFG_LENS = LensingConfig()
 CFG_COSMO = CosmologyConfig()
 CFG_DATA = DatasetConfig()
 CFG_XRAY = XrayConfig()
+
+
+# ============================================================
+# The one draw the two slurm stages share
+# ============================================================
+
+def sample_z_lens(sim, cluster_idx, proj_index, cfg=CFG_LENS):
+    """
+    The lens redshift of sample (sim, cluster_idx, proj_index), drawn uniformly
+    from [z_lens_min, z_lens_max].
+
+    Both stages call this and must get the same answer: xray_photons.py builds a
+    pyXSIM photon list at exactly this redshift, and build_bahamas_dataset.py
+    reads that list back for the matching sample. So the draw is keyed on the
+    sample's identity via SeedSequence rather than pulled from a sequential rng
+    stream -- it does not move if the simulation tuple, the cluster range, the
+    projection count or the loop order changes, and either stage can compute it
+    for one sample without replaying the others.
+
+    crc32 rather than hash() for the simulation name: Python string hashing is
+    salted per process, so hash() would give a different answer on every run.
+    """
+    key = [int(cfg.z_lens_seed),
+           int(zlib.crc32(str(sim).encode("utf-8"))),
+           int(cluster_idx),
+           int(proj_index)]
+    rng = np.random.default_rng(np.random.SeedSequence(key))
+    return float(rng.uniform(cfg.z_lens_min, cfg.z_lens_max))
 
 
 # Smoke-test override: set SHAPE_DYN_SMOKE_TEST=1 to shrink the dataset to a

@@ -26,13 +26,17 @@ import pyxsim
 from yt.utilities.cosmology import Cosmology
 from astropy.io import fits
 
-from config import CFG_XRAY, CFG_COSMO, CFG_DATA, CFG_LENS
+from config import CFG_XRAY, CFG_COSMO, CFG_DATA
 
 # --- physical constants (CGS), as in the notebook ---
 MP = 1.67262192369e-24        # proton mass, g
 MSUN = 1.98892e33             # solar mass, g (yt's value)
 KPC = 3.0856775809623245e21   # cm
 MPC = 1.0e3 * KPC
+KEV_TO_ERG = 1.602176634e-9
+K_TO_KEV = 8.617333262e-8
+# Critical density at z=0 in Msun/Mpc^3, divided by h^2.
+RHO_CRIT_OVER_H2 = 2.77536627e11
 
 BOXSIZE_MPC_OVER_H = 400.0    # BAHAMAS box (cMpc/h)
 
@@ -90,27 +94,52 @@ def viewing_basis(proj_vec):
     return u, v, w
 
 
-def z_bin_centers():
-    """Redshift bin centres the photon lists are generated on."""
-    edges = np.arange(CFG_LENS.z_lens_min, CFG_LENS.z_lens_max + 1e-9,
-                      CFG_XRAY.z_bin_width)
-    return [round(float(e + 0.5 * CFG_XRAY.z_bin_width), 6) for e in edges[:-1]]
+def photon_sim_dir(sim, cfg=CFG_XRAY):
+    """The photon-list directory for one dark-matter model."""
+    return os.path.join(cfg.photon_dir, str(sim))
 
 
-def nearest_z_bin(z_lens):
-    """The photon-list bin a sample at z_lens should be observed from."""
-    centers = z_bin_centers()
-    return centers[int(np.argmin(np.abs(np.asarray(centers) - z_lens)))]
+def photon_prefix(sim, cluster_idx, proj_index, cfg=CFG_XRAY):
+    """
+    Where the photon stage writes, and the dataset build reads, the photon list
+    for one sample:
+
+        <photon_dir>/<sim>/<sim>_GrNm_<cluster>_p<projection>_photons.h5
+
+    Keyed on the sample's identity, not on its redshift: two projections of a
+    cluster can draw z_lens values that agree to four decimals, and a
+    redshift-formatted name would silently collide. The redshift each list was
+    actually built at is recorded inside the file as parameters/fid_redshift and
+    checked on read against config.sample_z_lens.
+
+    The model name is repeated in the filename even though the directory already
+    carries it, so a list stays identifiable if it is ever copied out on its own.
+    """
+    return os.path.join(photon_sim_dir(sim, cfg),
+                        f"{sim}_GrNm_{cluster_idx:03d}_p{int(proj_index):d}_photons")
 
 
-def photon_prefix(sim, cluster_idx, z_bin):
-    """Where the photon stage writes, and the dataset build reads, a photon list."""
-    return os.path.join(CFG_XRAY.photon_dir,
-                        f"{sim}_GrNm_{cluster_idx:03d}_z{z_bin:.4f}_photons")
+def photon_list_redshift(prefix):
+    """The redshift a photon list was generated at, or nan if unreadable."""
+    try:
+        import h5py
+        with h5py.File(prefix + ".h5", "r") as f:
+            return float(f["/parameters/fid_redshift"][()])
+    except Exception:
+        return float("nan")
 
 
 def density_unit_cgs(h, a):
-    """gas_dens is Gadget code density, 1e10 Msun/h per (cMpc/h)^3 -> g/cm^3."""
+    """
+    gas_dens is Gadget code density, 1e10 Msun/h per (cMpc/h)^3 -> g/cm^3.
+
+    Equals h^2 a^-3 * 6.770e-31, which reproduces the GADGET CGSConversionFactor
+    6.76991e-31 quoted for these BAHAMAS snapshots to 4e-5. The particle *masses*,
+    by contrast, already have h divided out: dm_mass = 5.5065e9 Msun is exactly
+    the published 3.85e9 h^-1 Msun at h = 0.7, and gas_mass's floor of 1.0942e9
+    is the published 7.66e8 h^-1 Msun. So gas_dens needs the h^2 and the masses
+    need nothing -- see the units check in tests/.
+    """
     return (1.0e10 * MSUN / h) / (MPC / h) ** 3 / a ** 3
 
 
@@ -187,6 +216,150 @@ def load_gas_dataset(data, center, cfg=CFG_XRAY):
     return ds, cfg.n_R200 * R200 * a / h            # physical Mpc
 
 
+# ============================================================
+# Intrinsic L_X, for checking the sample against LoVoCCS's X-ray selection
+# ============================================================
+
+_LAMBDA_TABLE = None
+
+
+def cooling_function_table(cfg=CFG_XRAY):
+    """
+    Band-limited APEC energy cooling function Lambda(T) over cfg.lx_band_kev, in
+    erg cm^3 s^-1, as (T_grid_K, Lambda_grid).
+
+    Built with SOXS's ApecGenerator rather than pyatomdb: it is the same
+    APEC v3.1.3 table (soxs already caches apec_v3.1.3_{coco,line}.fits), so
+    there is no extra dependency and nothing to download.
+
+    Lambda is defined by L_X = Lambda(T, Z) * EM with EM = n_e n_H V, which is
+    the convention the emission_measure field already uses.
+    """
+    global _LAMBDA_TABLE
+    if _LAMBDA_TABLE is not None:
+        return _LAMBDA_TABLE
+
+    from soxs.spectra import ApecGenerator
+
+    emin, emax = cfg.lx_band_kev
+    agen = ApecGenerator(emin, emax, cfg.lx_nbins, broadening=False)
+
+    T_grid = np.logspace(np.log10(cfg.lx_T_grid_min_K),
+                         np.log10(cfg.lx_T_grid_max_K), cfg.lx_T_grid_n)
+    # A norm of 1e-14/(4 pi D^2) at z = 0 corresponds to EM = 1 cm^-3, so
+    # 4 pi D^2 * (band-integrated energy flux) is Lambda directly.
+    D = MPC
+    norm = 1.0e-14 / (4.0 * np.pi * D ** 2)
+    four_pi_d2 = 4.0 * np.pi * D ** 2
+
+    Lambda = np.empty_like(T_grid)
+    for i, T in enumerate(T_grid):
+        sp = agen.get_spectrum(T * K_TO_KEV, cfg.Z_met, 0.0, norm)
+        e = sp.emid.value                      # keV
+        de = np.diff(sp.ebins.value)           # keV
+        flux_erg = np.sum(sp.flux.value * de * e) * KEV_TO_ERG
+        Lambda[i] = four_pi_d2 * flux_erg
+
+    _LAMBDA_TABLE = (T_grid, Lambda)
+    return _LAMBDA_TABLE
+
+
+def cooling_function(T_K, cfg=CFG_XRAY):
+    """
+    Lambda(T) in erg cm^3 s^-1 for each temperature. Zero below the grid (gas
+    that cold contributes nothing in band) and clamped to the top value above
+    it, matching the treatment in the collaborator's APEC notebook.
+    """
+    T_grid, Lambda = cooling_function_table(cfg)
+    out = np.interp(np.asarray(T_K, dtype=np.float64), T_grid, Lambda,
+                    left=0.0, right=Lambda[-1])
+    return np.where(np.asarray(T_K) < T_grid[0], 0.0, out)
+
+
+def r500c_mpc_over_h(data, center, cfg=CFG_XRAY):
+    """
+    R500c about `center`, in comoving Mpc/h, from the particles themselves:
+    the largest radius whose enclosed mean density is >= 500 rho_crit(z=0).
+
+    The npz carries R200/M200 but not R500, and LoVoCCS quotes L_X inside R500c.
+    """
+    h = float(data["h"])
+    a = float(data["a"])
+    BOX = BOXSIZE_MPC_OVER_H
+
+    r_list, m_list = [], []
+    for pos_key, mass_key in (("dm_pos", "dm_mass"), ("gas_pos", "gas_mass"),
+                              ("star_pos", "star_mass"), ("bh_pos", "bh_mass")):
+        if pos_key not in data.files or mass_key not in data.files:
+            continue
+        if data[pos_key].shape[0] == 0:
+            continue
+        dx = (data[pos_key] - center + 0.5 * BOX) % BOX - 0.5 * BOX
+        r_list.append(np.linalg.norm(dx, axis=1))
+        m_list.append(data[mass_key])          # Msun, h already divided out
+    r = np.concatenate(r_list)
+    m = np.concatenate(m_list)
+
+    order = np.argsort(r)
+    r_sorted = r[order]                        # comoving Mpc/h
+    m_cum = np.cumsum(m[order])                # Msun
+
+    # Mean enclosed density in physical Msun/Mpc^3.
+    r_phys = np.maximum(r_sorted * a / h, 1e-6)
+    rho_mean = m_cum / ((4.0 / 3.0) * np.pi * r_phys ** 3)
+    rho_500 = 500.0 * RHO_CRIT_OVER_H2 * h ** 2
+
+    # The *innermost* crossing, not the outermost: a massive neighbour inside
+    # the 5 R200 cutout can push the running mean back above 500 rho_c at large
+    # radius, and the outermost crossing would then return its radius instead of
+    # the cluster's. n_min skips the shot-noise-dominated first few particles,
+    # where the running mean is meaningless.
+    n_min = 100
+    if r_sorted.size <= n_min:
+        return float("nan")
+    below = np.flatnonzero(rho_mean[n_min:] < rho_500)
+    if below.size == 0:
+        return float("nan")                      # never drops: cutout too small
+    return float(r_sorted[n_min + below[0] - 1])
+
+
+def lx500c_erg_s(data, center, cfg=CFG_XRAY):
+    """
+    Rest-frame L_X inside R500c over cfg.lx_band_kev, in erg s^-1, from the same
+    hot-gas selection the photon lists use (T > T_min_K, n_H < nH_max).
+
+    Recorded for comparison against LoVoCCS's L_X500c > 1e44 erg/s selection.
+    It is a diagnostic only: no simulated cluster is dropped on it.
+
+    Returns (L_X, R500c in comoving Mpc/h, number of hot particles used).
+    """
+    h = float(data["h"])
+    a = float(data["a"])
+    BOX = BOXSIZE_MPC_OVER_H
+
+    r500 = r500c_mpc_over_h(data, center, cfg)
+    if not np.isfinite(r500):
+        return float("nan"), float("nan"), 0
+
+    dx = (data["gas_pos"] - center + 0.5 * BOX) % BOX - 0.5 * BOX
+    r = np.linalg.norm(dx, axis=1)
+
+    rho = data["gas_dens"] * density_unit_cgs(h, a)      # physical g/cm^3
+    T = data["gas_temp"]                                 # K
+    X_H = cfg.X_H
+    nH = X_H * rho / MP
+    ne = (X_H + 0.5 * (1.0 - X_H)) * rho / MP
+
+    sel = (r < r500) & (T > cfg.T_min_K) & (nH < cfg.nH_max)
+    if not np.any(sel):
+        return 0.0, r500, 0
+
+    volume = (data["gas_mass"][sel] * MSUN) / rho[sel]   # cm^3
+    em = ne[sel] * nH[sel] * volume                      # cm^-3
+    lx = float(np.sum(em * cooling_function(T[sel], cfg)))
+    return lx, r500, int(sel.sum())
+
+
 def source_model(cfg=CFG_XRAY):
     return pyxsim.CIESourceModel(
         "apec", cfg.emin_kev, cfg.emax_kev, cfg.nbins,
@@ -199,22 +372,75 @@ def source_model(cfg=CFG_XRAY):
     )
 
 
+def photon_list_is_complete(prefix):
+    """
+    True if prefix + '.h5' exists and is a readable, fully written photon list.
+
+    A task killed at the wall clock leaves a truncated .h5 behind. Since the
+    photon stage skips bins whose file already exists, a bare existence check
+    would let that corpse survive every restart and only fail later, in the
+    dataset build. Opening it is cheap next to regenerating it.
+    """
+    path = prefix + ".h5"
+    if not os.path.exists(path):
+        return False
+    try:
+        import h5py
+        with h5py.File(path, "r") as f:
+            # data/energy is the largest array and the last one filled, so a
+            # truncated write shows up as a length mismatch against the
+            # per-cell photon counts.
+            n_expected = int(f["/data/num_photons"][:].sum())
+            return (f["/data/energy"].shape[0] == n_expected
+                    and "/parameters/fid_exp_time" in f)
+    except Exception:
+        return False
+
+
 def make_photon_list(prefix, ds, radius_mpc, redshift, cosmo, cfg=CFG_XRAY):
-    """The expensive step (~2.5 min): projection-independent, redshift-dependent."""
+    """
+    The expensive step (~2.5 min): projection-independent, redshift-dependent.
+
+    Written to a scratch prefix and renamed into place, so an interrupted run
+    can never leave a half-written .h5 that the restart mistakes for a finished
+    one. os.replace is atomic within a filesystem.
+    """
     c = ds.arr([0.0, 0.0, 0.0], "kpc")
     src = ds.sphere(c, (radius_mpc, "Mpc"))
-    n_ph, n_cells = pyxsim.make_photons(
-        prefix, src, redshift,
-        (cfg.sample_area_cm2, "cm**2"), (cfg.sample_exp_ks, "ks"),
-        source_model(cfg), cosmology=cosmo, center=c,
-    )
+
+    tmp_prefix = prefix + ".tmp"
+    for stale in glob.glob(tmp_prefix + "*"):
+        try:
+            os.remove(stale)
+        except OSError:
+            pass
+
+    try:
+        n_ph, n_cells = pyxsim.make_photons(
+            tmp_prefix, src, redshift,
+            (cfg.sample_area_cm2, "cm**2"), (cfg.sample_exp_ks, "ks"),
+            source_model(cfg), cosmology=cosmo, center=c,
+        )
+        os.replace(tmp_prefix + ".h5", prefix + ".h5")
+    except BaseException:
+        for junk in glob.glob(tmp_prefix + "*"):
+            try:
+                os.remove(junk)
+            except OSError:
+                pass
+        raise
+
     return int(n_ph), int(n_cells)
 
 
-def project_and_observe(photon_prefix, work_prefix, proj_vec, cfg=CFG_XRAY):
+def project_and_observe(photon_prefix, work_prefix, proj_vec, t_exp_ks,
+                        cfg=CFG_XRAY):
     """
-    Project the photon list along the sample's viewing direction and run the
-    3x3 ACIS-I mosaic. Returns the paths of the products, all under work_prefix.
+    Project the photon list along the sample's viewing direction and observe it
+    for t_exp_ks with cfg.n_side^2 ACIS pointings (one, by default, matching the
+    archival Chandra coverage a LoVoCCS cluster actually has).
+
+    Returns the paths of the products, all under work_prefix.
     """
     u, v, w = viewing_basis(proj_vec)
 
@@ -233,7 +459,9 @@ def project_and_observe(photon_prefix, work_prefix, proj_vec, cfg=CFG_XRAY):
                             emin=cfg.band_emin_kev, emax=cfg.band_emax_kev,
                             overwrite=True)
 
-    # (c) the mosaic: SOXS observes the SIMPUT catalogue from n_side^2 pointings.
+    # (c) the observation: SOXS points the instrument at the SIMPUT catalogue.
+    # make_mosaic_events handles the single-pointing case too, so the products
+    # and their names are the same whether n_side is 1 or 3.
     events.write_to_simput(work_prefix, overwrite=True)
     ra0, dec0 = cfg.sky_center
     pointings = [(ra0 + ddx / np.cos(np.deg2rad(dec0)), dec0 + ddy)
@@ -241,7 +469,7 @@ def project_and_observe(photon_prefix, work_prefix, proj_vec, cfg=CFG_XRAY):
 
     mosaic_table = soxs.make_mosaic_events(
         pointings, f"{work_prefix}_simput.fits", f"{work_prefix}_mosaic",
-        (cfg.t_exp_ks, "ks"), cfg.instrument, overwrite=True,
+        (t_exp_ks, "ks"), cfg.instrument, overwrite=True,
         instr_bkgnd=cfg.instr_bkgnd, foreground=cfg.foreground,
         ptsrc_bkgnd=cfg.ptsrc_bkgnd,
     )
@@ -390,7 +618,12 @@ def build_sample_maps(products, redshift, h, cfg=CFG_XRAY):
         "xray_ideal": ideal.astype(np.float32),
         "xray_arcsec_per_pix": np.float32(pix_arcsec),
         "xray_mpc_per_pix": np.float32(mpc_per_pixel(redshift, h, cfg)),
-        "xray_redshift": np.float32(redshift),
+        # float64 to match the group's z_lens attr exactly: the photon list was
+        # generated at that redshift, and the two should compare equal.
+        "xray_redshift": np.float64(redshift),
+        # The realised depth, read back from the event header rather than taken
+        # from the draw, so it is whatever SOXS actually integrated.
+        "xray_t_exp_ks": np.float32(t_exp_s / 1.0e3),
     }
 
 

@@ -31,8 +31,18 @@ projection vector rotates both the cluster members and the matter particles):
     inside a dithered rectangular pointing survive, with probability equal to
     the fraction of exposures covering them.
 
+    Sources follow LoVoCCS II's background selection (z_lens + 0.1 < z_phot
+    < 1.4, applied to the n(z) template before drawing so the density stays at
+    ~7 arcmin^-2) and carry LoVoCCS III's BPZ error: the lensing uses a true
+    redshift scattered about z_phot by sigma_z/(1+z) = 0.051 with a 5.3%
+    catastrophic-outlier rate, while the catalog reports only z_phot. Sources
+    scattered in front of the lens are unsheared, which is the contamination a
+    real cluster WL analysis has to correct for; it is summarised per sample as
+    src_true_foreground_frac.
+
     Each sample stores, ragged (no padding, variable N):
       src_features (N, 8) float32: e1, e2, ix, iy, z_s, z_lens, cell_frac, coverage
+        - z_s: the BPZ point estimate, i.e. what an observer measures
         - ix, iy: integer cell coordinates on the shape grid (stored as float32)
         - cell_frac: (# sources in that cell) / N
         - coverage: fraction of exposures covering that source
@@ -41,16 +51,26 @@ projection vector rotates both the cluster members and the matter particles):
       src_coverage (S, S)  float32: the same coverage fraction on the shape grid,
         so an empty cell is distinguishable from an unobserved one
 
-  - NEW: a mock Chandra ACIS-I X-ray mosaic of the same cluster, in the same
-    viewing frame. xray_photons.py has already made the pyXSIM photon list for
-    each (sim, cluster, redshift bin); each sample projects the list nearest its
-    z_lens along its own viewing direction and observes it with a 3x3 ACIS-I
-    mosaic. Stored on a fixed 52' *angular* grid, so the physical scale is a
-    per-sample attribute (xray_mpc_per_pix):
+  - NEW: a mock Chandra ACIS-I X-ray observation of the same cluster, in the
+    same viewing frame. xray_photons.py has already made one pyXSIM photon list
+    per (sim, cluster, projection), at that sample's exact z_lens; each sample
+    projects its own list along its viewing direction and observes it. The two
+    stages agree on z_lens through config.sample_z_lens, which keys the draw on
+    the sample's identity instead of on either script's rng stream.
+
+    LoVoCCS's X-ray coverage is archival Chandra/XMM rather than a designed
+    survey, so a cluster gets one ACIS-I pointing at a depth drawn per sample
+    (lognormal about 30 ks, clipped to 10-100 ks) instead of a uniform mosaic.
+    Stored on a fixed 20' *angular* grid -- one ACIS-I field -- so a cluster's
+    apparent size varies with its redshift while the image shape does not; the
+    physical scale is a per-sample attribute (xray_mpc_per_pix):
       xray_mosaic (G,G): exposure-corrected 0.5-2 keV surface brightness
-      xray_counts (G,G): mosaic counts
-      xray_expmap (G,G): mean exposure map, cm^2 s
+      xray_counts (G,G): counts
+      xray_expmap (G,G): mean exposure map, cm^2 (SOXS normalises out the time)
       xray_ideal  (G,G): the same band with no instrument, PSF or background
+    plus the group attrs xray_t_exp_ks (the realised depth) and lx500c_erg_s
+    (intrinsic 0.1-2.4 keV luminosity inside R500c, for comparison against
+    LoVoCCS's L_X > 1e44 erg/s selection -- a diagnostic, never a cut).
 
 Prerequisites:
   - build_lovoccs_redshift_template.py (run once) when
@@ -76,7 +96,8 @@ import TNG_DA  # rotate_to_viewing_frame
 # config.py, lensing_utils.py and xray_utils.py are shared across simulations and
 # live one level up, in dataset/.
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import CFG_GRID, CFG_SCALE, CFG_LENS, CFG_COSMO, CFG_DATA, CFG_XRAY
+from config import (CFG_GRID, CFG_SCALE, CFG_LENS, CFG_COSMO, CFG_DATA,
+                    CFG_XRAY, sample_z_lens)
 import lensing_utils as lu
 
 # ------------------------------------------------------------
@@ -474,7 +495,61 @@ def rho_cube_to_axis_lengths_mpc(rho_cube, fov_mpc) -> Tuple[float, float, float
 
 def _empty_catalog():
     return {k: np.zeros((0,), dtype=np.float32)
-            for k in ("x", "y", "z_s", "e1_obs", "e2_obs")}
+            for k in ("x", "y", "z_s", "z_true", "e1_obs", "e2_obs")}
+
+
+def lovoccs_background_template(z_l):
+    """
+    The slice of the empirical n(z) that survives LoVoCCS II's background cuts
+    for a lens at z_l: a foreground cut at z_l + src_z_foreground_pad and a
+    high-z cut at src_z_max.
+
+    Applied to the template *before* drawing rather than to the drawn catalog,
+    which is what keeps the surviving density at n_source_per_arcmin2. LoVoCCS's
+    ~7 arcmin^-2 is itself quoted after these cuts (it falls from ~22 arcmin^-2
+    with shape and photometry cuts alone), so cutting a 7 arcmin^-2 draw down
+    afterwards would double-count the loss.
+
+    _EMPIRICAL_Z_TEMPLATE is pre-sorted in main(), so this is two searchsorteds.
+    """
+    z_lo = z_l + CFG_LENS.src_z_foreground_pad
+    # side='right' / 'left' make both bounds strict: z_lo < z_s < src_z_max.
+    lo = np.searchsorted(_EMPIRICAL_Z_TEMPLATE, z_lo, side="right")
+    hi = np.searchsorted(_EMPIRICAL_Z_TEMPLATE, CFG_LENS.src_z_max, side="left")
+    return _EMPIRICAL_Z_TEMPLATE[lo:hi]
+
+
+def bpz_true_redshifts(z_phot, rng):
+    """
+    True redshifts behind a set of BPZ point estimates.
+
+    The empirical template is built from real LoVoCCS BPZ z_b values, so a drawn
+    z is what an observer *measures*; the truth scatters about it. LoVoCCS III
+    quotes sigma_z/(1+z) ~ 0.051 with a catastrophic-outlier rate eta ~ 5.3%,
+    so the core gets a Gaussian of that width and the outliers are redrawn from
+    the full n(z) -- including in front of the lens, which is the point. A
+    source whose z_phot passes the background cut but whose z_true sits at or
+    below z_lens is unlensed, and dilutes the shear exactly the way real
+    contamination does.
+
+    Direction, stated plainly because it is an approximation: 0.051 is the
+    scatter of z_phot about z_spec, i.e. it describes p(z_phot | z_true), and
+    inverting it properly needs the true n(z) as a prior. Applying it
+    symmetrically as p(z_true | z_phot) is the usual mock-catalog shortcut and
+    is what happens here.
+    """
+    n = z_phot.size
+    z_true = z_phot + rng.normal(0.0, CFG_LENS.bpz_sigma_z * (1.0 + z_phot))
+
+    outlier = rng.random(n) < CFG_LENS.bpz_outlier_rate
+    n_out = int(np.count_nonzero(outlier))
+    if n_out:
+        # From the *whole* template, not the background-cut slice: a
+        # catastrophic failure can land anywhere, foreground included.
+        z_true[outlier] = lu.sample_empirical_redshifts(
+            n_out, _EMPIRICAL_Z_TEMPLATE, rng=rng)
+
+    return np.maximum(z_true, 0.0), outlier
 
 
 def draw_shape_catalog(kappa_inf, gamma1_inf, gamma2_inf, sigma_crit_inf,
@@ -482,7 +557,11 @@ def draw_shape_catalog(kappa_inf, gamma1_inf, gamma2_inf, sigma_crit_inf,
     """
     Synthetic source catalog:
       - n_source = CFG_LENS.n_source_per_arcmin2 over the full rectangular FoV
-      - per-galaxy z_s bootstrapped from the empirical n(z) template
+      - per-galaxy z_phot bootstrapped from the empirical n(z) template,
+        restricted to LoVoCCS's background selection for this lens redshift
+      - a true redshift behind each z_phot (bpz_true_redshifts). The lensing
+        uses z_true; the catalog reports z_phot, because that is all an observer
+        has. Sources scattered in front of the lens are simply not sheared.
       - optional magnification thinning with rate ~ mu^(2.5*alpha_mag - 1)
       - per-source convergence/shear use the per-source critical surface density
             Sigma_crit(z_l, z_s) = c^2 / (4 pi G) * D_s / (D_l * D_ls),
@@ -525,12 +604,28 @@ def draw_shape_catalog(kappa_inf, gamma1_inf, gamma2_inf, sigma_crit_inf,
     x_g = rng.uniform(-fov_mpc, fov_mpc, size=n_proposed)
     y_g = rng.uniform(-fov_mpc, fov_mpc, size=n_proposed)
 
-    z_s = lu.sample_empirical_redshifts(n_proposed, _EMPIRICAL_Z_TEMPLATE, rng=rng)
+    z_template = lovoccs_background_template(z_l)
+    if z_template.size == 0:
+        raise RuntimeError(
+            f"no template sources survive the LoVoCCS background cuts at "
+            f"z_l={z_l:.4f}: need {z_l + CFG_LENS.src_z_foreground_pad:.3f} "
+            f"< z_s < {CFG_LENS.src_z_max}"
+        )
+    # What the observer measures. The LoVoCCS background cuts are applied to
+    # this, on the template, so they neither bias the count nor peek at truth.
+    z_phot = lu.sample_empirical_redshifts(n_proposed, z_template, rng=rng)
 
-    # Per-source critical surface density Sigma_crit(z_l, z_s); foreground
+    # What actually lenses. Some of these fall in front of the cluster despite
+    # z_phot passing the cut; that is the contamination real catalogs carry.
+    if CFG_LENS.apply_photoz_error:
+        z_true, _ = bpz_true_redshifts(z_phot, rng)
+    else:
+        z_true = z_phot
+
+    # Per-source critical surface density Sigma_crit(z_l, z_true); foreground
     # sources get Sigma_crit -> +inf and thus feel no lensing.
     sigma_crit_src = lu.sigma_crit_msun_per_mpc2(
-        z_l, z_s, H0=CFG_COSMO.H0, Om0=CFG_COSMO.Om0)
+        z_l, z_true, H0=CFG_COSMO.H0, Om0=CFG_COSMO.Om0)
 
     k_inf_g = lu.bilinear_sample(kappa_inf, x_g, y_g, fov_mpc)
     g1_inf_g = lu.bilinear_sample(gamma1_inf, x_g, y_g, fov_mpc)
@@ -555,13 +650,15 @@ def draw_shape_catalog(kappa_inf, gamma1_inf, gamma2_inf, sigma_crit_inf,
     else:
         keep_mag = np.ones(n_proposed, dtype=bool)
 
-    x_g, y_g, z_s = x_g[keep_mag], y_g[keep_mag], z_s[keep_mag]
+    x_g, y_g = x_g[keep_mag], y_g[keep_mag]
+    z_phot, z_true = z_phot[keep_mag], z_true[keep_mag]
     k_eff = k_eff[keep_mag]; g1_eff = g1_eff[keep_mag]; g2_eff = g2_eff[keep_mag]
 
     # reduced shear; reject |g| >= 1 (interior of critical curve)
     g_complex = (g1_eff + 1j * g2_eff) / (1.0 - k_eff + 1e-30)
     keep_g = np.abs(g_complex) < 1.0
-    x_g, y_g, z_s = x_g[keep_g], y_g[keep_g], z_s[keep_g]
+    x_g, y_g = x_g[keep_g], y_g[keep_g]
+    z_phot, z_true = z_phot[keep_g], z_true[keep_g]
     g_complex = g_complex[keep_g]
 
     # Intrinsic ellipticities, drawn wide and truncated to the physical |e| < 1
@@ -572,7 +669,12 @@ def draw_shape_catalog(kappa_inf, gamma1_inf, gamma2_inf, sigma_crit_inf,
     return {
         "x": x_g.astype(np.float32),
         "y": y_g.astype(np.float32),
-        "z_s": z_s.astype(np.float32),
+        # z_s is the BPZ point estimate: the observable, and the only redshift
+        # that reaches the stored catalog. z_true is carried alongside purely so
+        # build_one_sample can report how much foreground contamination the
+        # photo-z scatter let through; it is never written per source.
+        "z_s": z_phot.astype(np.float32),
+        "z_true": z_true.astype(np.float32),
         "e1_obs": e_obs.real.astype(np.float32),
         "e2_obs": e_obs.imag.astype(np.float32),
     }
@@ -633,6 +735,10 @@ def process_source_catalog(cat, z_lens, fov, S):
 # ============================================================
 
 _XU = None
+# L_X500c depends only on (sim, cluster), not on the viewing direction, so the
+# ~2 s spherical-overdensity solve is cached rather than paid once per
+# projection. Per worker process, so it holds n_projections entries at most.
+_LX_CACHE = {}
 
 
 def _xray_module():
@@ -648,72 +754,88 @@ def _xray_module():
     return _XU
 
 
-def z_lens_for_seed(seed) -> float:
-    """
-    The lens redshift build_one_sample will draw for this job. It is that rng's
-    first call, so a fresh generator on the same seed reproduces it; used to
-    check the photon lists exist before a long run starts.
-    """
-    return float(np.random.default_rng(seed).uniform(
-        CFG_LENS.z_lens_min, CFG_LENS.z_lens_max))
-
-
 def check_photon_lists(jobs):
     """
     Fail before the build starts, not two hours in, if xray_photons.slurm has
-    not covered every (sim, cluster, redshift bin) the sample list needs.
+    not covered every (sim, cluster, projection) the sample list needs.
+
+    Also checks the redshift each list was *actually* generated at against
+    config.sample_z_lens. The two stages agree only because they call the same
+    keyed function; if that ever drifts -- a changed z_lens_seed, an edited
+    z_lens range, a stale list left over from an earlier run -- the maps would
+    silently be at the wrong distance, so it is worth the h5 open per list.
     """
     if not CFG_XRAY.enabled:
         print("X-ray maps disabled (CFG_XRAY.enabled = False)")
         return
 
     xu = _xray_module()
-    needed, missing = set(), set()
-    for _, sim, cluster_idx, _, seed in jobs:
-        z_bin = xu.nearest_z_bin(z_lens_for_seed(seed))
-        key = (sim, cluster_idx, z_bin)
+    needed, missing, mismatched = set(), set(), []
+    for _, sim, cluster_idx, proj_index, _, _ in jobs:
+        key = (sim, cluster_idx, proj_index)
         if key in needed:
             continue
         needed.add(key)
-        if not os.path.exists(xu.photon_prefix(sim, cluster_idx, z_bin) + ".h5"):
+        prefix = xu.photon_prefix(sim, cluster_idx, proj_index)
+        if not xu.photon_list_is_complete(prefix):
             missing.add(key)
+            continue
+        z_want = sample_z_lens(sim, cluster_idx, proj_index)
+        z_have = xu.photon_list_redshift(prefix)
+        if not np.isfinite(z_have) or abs(z_have - z_want) > 1e-6:
+            mismatched.append((sim, cluster_idx, proj_index, z_want, z_have))
 
     if missing:
         examples = "\n  ".join(
-            f"{s} GrNm_{c:03d} z={z:.4f}" for s, c, z in sorted(missing)[:5])
+            f"{s} GrNm_{c:03d} p{p} (z={sample_z_lens(s, c, p):.5f})"
+            for s, c, p in sorted(missing)[:5])
         raise FileNotFoundError(
-            f"{len(missing)} of {len(needed)} photon lists are missing from "
-            f"{CFG_XRAY.photon_dir}, e.g.:\n  {examples}\n"
+            f"{len(missing)} of {len(needed)} photon lists are missing or "
+            f"incomplete in {CFG_XRAY.photon_dir}, e.g.:\n  {examples}\n"
             f"Run xray_photons.slurm first, or set CFG_XRAY.enabled = False."
         )
+    if mismatched:
+        examples = "\n  ".join(
+            f"{s} GrNm_{c:03d} p{p}: want z={zw:.6f}, file has z={zh:.6f}"
+            for s, c, p, zw, zh in mismatched[:5])
+        raise RuntimeError(
+            f"{len(mismatched)} of {len(needed)} photon lists were generated at "
+            f"a different redshift than config.sample_z_lens now returns, "
+            f"e.g.:\n  {examples}\n"
+            f"CFG_LENS.z_lens_seed / z_lens_min / z_lens_max or "
+            f"CFG_DATA.n_projections must have changed since xray_photons.slurm "
+            f"ran. Regenerate the lists (--overwrite) or restore the old values."
+        )
+    n_pt = CFG_XRAY.n_side ** 2
     print(f"X-ray: {len(needed)} photon lists present in {CFG_XRAY.photon_dir}; "
-          f"{CFG_XRAY.n_side}x{CFG_XRAY.n_side} {CFG_XRAY.instrument} mosaic, "
-          f"{CFG_XRAY.t_exp_ks} ks per pointing, "
+          f"{n_pt} {CFG_XRAY.instrument} pointing{'s' if n_pt > 1 else ''}, "
+          f"exposure ~lognormal(median {CFG_XRAY.t_exp_median_ks} ks, "
+          f"sigma_ln {CFG_XRAY.t_exp_sigma_ln}) clipped to "
+          f"[{CFG_XRAY.t_exp_min_ks}, {CFG_XRAY.t_exp_max_ks}] ks, "
           f"{CFG_XRAY.band_emin_kev}-{CFG_XRAY.band_emax_kev} keV, stored "
           f"{CFG_XRAY.grid_size}^2 over {CFG_XRAY.fov_arcmin}'")
 
 
-def build_xray_maps(sim, cluster_idx, proj_vec, z_lens, h_sim, seed):
+def build_xray_maps(sim, cluster_idx, proj_index, proj_vec, z_lens, h_sim,
+                    seed, t_exp_ks):
     """
     Project this sample's photon list along its viewing direction and observe it
-    with a 3x3 ACIS-I mosaic. ~2 min per sample, and by far the most expensive
-    thing in build_one_sample.
+    for t_exp_ks. By far the most expensive thing in build_one_sample.
 
     make_photons already ran in xray_photons.py, once per (sim, cluster,
-    redshift bin); here we pick the bin nearest z_lens and do the parts that
-    depend on the projection.
+    projection) at exactly this sample's z_lens; here we do the parts that
+    depend on the viewing direction and the depth.
     """
     if not CFG_XRAY.enabled:
         return None
 
     xu = _xray_module()
-    z_bin = xu.nearest_z_bin(z_lens)
-    photon_prefix = xu.photon_prefix(sim, cluster_idx, z_bin)
+    photon_prefix = xu.photon_prefix(sim, cluster_idx, proj_index)
     if not os.path.exists(photon_prefix + ".h5"):
         raise FileNotFoundError(
-            f"no photon list for {sim} GrNm_{cluster_idx:03d} at z={z_bin:.4f} "
-            f"({photon_prefix}.h5). Run xray_photons.slurm first, or set "
-            f"CFG_XRAY.enabled = False."
+            f"no photon list for {sim} GrNm_{cluster_idx:03d} p{proj_index} "
+            f"(z={z_lens:.5f}) at {photon_prefix}.h5. Run xray_photons.slurm "
+            f"first, or set CFG_XRAY.enabled = False."
         )
 
     # Relative to the worker's CWD (CFG_XRAY.work_dir, set in _init_worker), so
@@ -721,8 +843,11 @@ def build_xray_maps(sim, cluster_idx, proj_vec, z_lens, h_sim, seed):
     # notebook. The seed makes it unique across samples.
     work_prefix = f"s_{sim}_{cluster_idx:03d}_{seed}"
     try:
-        products = xu.project_and_observe(photon_prefix, work_prefix, proj_vec)
-        maps = xu.build_sample_maps(products, z_bin, h_sim)
+        products = xu.project_and_observe(photon_prefix, work_prefix, proj_vec,
+                                          t_exp_ks)
+        # The photon list is at this sample's own z_lens, so the angular scale
+        # the maps are stored with is the same one the lensing geometry uses.
+        maps = xu.build_sample_maps(products, z_lens, h_sim)
     finally:
         xu.clean_intermediates(work_prefix)     # never touches the photon list
     return maps
@@ -733,11 +858,14 @@ def build_xray_maps(sim, cluster_idx, proj_vec, z_lens, h_sim, seed):
 # ============================================================
 
 def build_one_sample(args) -> Dict:
-    npz_path, sim, cluster_idx, proj_vec, seed = args
+    npz_path, sim, cluster_idx, proj_index, proj_vec, seed = args
     rng = np.random.default_rng(seed)
 
-    # Per-sample lens redshift, uniform over [z_lens_min, z_lens_max].
-    z_lens = float(rng.uniform(CFG_LENS.z_lens_min, CFG_LENS.z_lens_max))
+    # Per-sample lens redshift. Not drawn from `rng`: xray_photons.py had to
+    # know it, in a separate slurm job, to generate the photon list at the right
+    # redshift, so it comes from the identity-keyed config.sample_z_lens that
+    # both stages share.
+    z_lens = sample_z_lens(sim, cluster_idx, proj_index)
 
     data = np.load(npz_path)
     h_sim = float(data["h"])
@@ -812,7 +940,15 @@ def build_one_sample(args) -> Dict:
         dif = pos_raw - center
         cc = (dif + 0.5 * boxsize) % boxsize - 0.5 * boxsize
         pos_mpc = (cc / (h_sim * a_scale)) + EPS
-        mass_msun = mass_raw / h_sim                                 # Msun/h -> Msun
+        # The particle masses are already Msun -- h is divided out in the cutout
+        # files. Verified three ways rather than taken from a comment: dm_mass
+        # is a single value 5.5065e9, which is exactly BAHAMAS's published
+        # 3.85e9 h^-1 Msun at h = 0.7; gas_mass's floor 1.0942e9 is the
+        # published 7.66e8 h^-1 Msun; and summing every species inside R200
+        # gives 0.9997 x M200 (median over all 100 CDMb clusters, range
+        # 0.996-1.000), which would be 1.428 x M200 with a 1/h applied.
+        # An earlier 1/h here inflated Sigma -> kappa -> gamma by 43%.
+        mass_msun = mass_raw                                         # already Msun
         rot, _ = TNG_DA.rotate_to_viewing_frame(pos_mpc, np.zeros_like(pos_mpc), proj_vec)
         return rot.astype(np.float32), mass_msun.astype(np.float32)
 
@@ -921,20 +1057,52 @@ def build_one_sample(args) -> Dict:
         float(keep.mean()) if n_drawn else 1.0,
     )
 
+    # How much of the surviving catalog is really in front of the lens despite
+    # passing the z_phot cut. Reported as a scalar, not per source: z_true never
+    # reaches the stored catalog, so a model cannot learn its way around the
+    # dilution, but the systematic can still be measured after the fact.
+    n_kept = int(cat["x"].size)
+    src_true_foreground_frac = (
+        float(np.mean(cat["z_true"] <= z_lens)) if n_kept else 0.0)
+    src_z_true_mean = float(np.mean(cat["z_true"])) if n_kept else float("nan")
+    cat.pop("z_true")
+
     src_features, src_cell_id, src_cell_ptr = process_source_catalog(
         cat, z_lens, fov, S)
 
     # -------------------------------
-    # Mock Chandra ACIS-I mosaic, in this same viewing frame
+    # Mock Chandra ACIS-I observation, in this same viewing frame
     # -------------------------------
-    xray = build_xray_maps(sim, cluster_idx, proj_vec, z_lens, h_sim, seed)
+    # Archival depth varies cluster to cluster, so the exposure is drawn per
+    # sample. Drawn from `rng` after everything above, so adding it does not
+    # move any earlier draw (z_lens in particular, which check_photon_lists
+    # reproduces from the seed).
+    t_exp_ks = CFG_XRAY.draw_exposure_ks(rng) if CFG_XRAY.enabled else 0.0
+    xray = build_xray_maps(sim, cluster_idx, proj_index, proj_vec, z_lens,
+                           h_sim, seed, t_exp_ks)
+
+    # LoVoCCS's X-ray selection is L_X500c(0.1-2.4 keV) > 1e44 erg/s. Stored so
+    # that selection can be inspected after the fact; nothing is cut on it.
+    if CFG_XRAY.enabled:
+        cache_key = (sim, cluster_idx)
+        if cache_key not in _LX_CACHE:
+            xu = _xray_module()
+            lx, r5, _ = xu.lx500c_erg_s(data, center)
+            _LX_CACHE[cache_key] = (lx, r5)
+        lx500c, r500c = _LX_CACHE[cache_key]
+    else:
+        lx500c, r500c = float("nan"), float("nan")
 
     return dict(
         sim=str(sim),
         cluster_idx=np.int32(cluster_idx),
+        proj_index=np.int32(proj_index),
         halo_mass=np.float32(data["Mfof"]),
         proj_vec=np.asarray(proj_vec, dtype=np.float32),
-        z_lens=np.float32(z_lens),
+        # float64: z_lens is the contract between this build and
+        # xray_photons.py, so it has to round-trip against sample_z_lens exactly
+        # rather than to float32's ~7 digits.
+        z_lens=np.float64(z_lens),
 
         gal_xy=gal_xy.astype(np.float32),
         gal_z_xy=gal_z_xy.astype(np.float32),
@@ -954,12 +1122,16 @@ def build_one_sample(args) -> Dict:
         src_coverage=src_coverage_map,
         pointing=pointing,
         keep_fracs=keep_fracs,
+        src_true_foreground_frac=np.float32(src_true_foreground_frac),
+        src_z_true_mean=np.float32(src_z_true_mean),
 
         raw_density_cube=density_cube,
         cube_mass_log10_msun=np.float32(cube_mass_log10_msun),
         axis_lengths_mpc=axis_lengths_mpc,
 
         xray=xray,
+        lx500c_erg_s=np.float64(lx500c),
+        r500c_mpc_over_h=np.float64(r500c),
     )
 
 
@@ -1003,8 +1175,30 @@ def write_static_attrs(f: h5py.File):
     f.attrs["shape_fov_mpc"] = CFG_GRID.fov_mpc
     f.attrs["z_lens_min"] = CFG_LENS.z_lens_min
     f.attrs["z_lens_max"] = CFG_LENS.z_lens_max
+    f.attrs["z_lens_seed"] = CFG_LENS.z_lens_seed
+    f.attrs["z_lens_note"] = (
+        "z_lens = config.sample_z_lens(simulation, cluster_index, "
+        "projection_index), keyed on the sample's identity rather than a "
+        "sequential rng stream so xray_photons.py and this build agree on it "
+        "across separate slurm jobs")
     f.attrs["n_source_per_arcmin2"] = CFG_LENS.n_source_per_arcmin2
     f.attrs["sigma_e_realized"] = CFG_LENS.sigma_e_realized
+    # LoVoCCS background selection and BPZ error model.
+    f.attrs["src_z_foreground_pad"] = CFG_LENS.src_z_foreground_pad
+    f.attrs["src_z_max"] = CFG_LENS.src_z_max
+    f.attrs["src_selection"] = (
+        "LoVoCCS II: z_lens + src_z_foreground_pad < z_phot < src_z_max, "
+        "applied to the empirical n(z) before drawing so the surviving density "
+        "is still n_source_per_arcmin2")
+    f.attrs["bpz_sigma_z"] = CFG_LENS.bpz_sigma_z
+    f.attrs["bpz_outlier_rate"] = CFG_LENS.bpz_outlier_rate
+    f.attrs["apply_photoz_error"] = bool(CFG_LENS.apply_photoz_error)
+    f.attrs["src_z_s_definition"] = (
+        "BPZ point estimate (the observable). Lensing was computed with a true "
+        "redshift scattered about it: Gaussian sigma_z = bpz_sigma_z*(1+z) for "
+        "the core and a bpz_outlier_rate fraction redrawn from the full n(z). "
+        "The true redshifts are not stored per source; the resulting dilution "
+        "is summarised per sample as src_true_foreground_frac.")
     f.attrs["sigma_e_gaussian_input"] = SIGMA_E_INPUT
 
     # Survey masks.
@@ -1041,11 +1235,24 @@ def write_static_attrs(f: h5py.File):
         f.attrs["xray_fov_arcmin"] = CFG_XRAY.fov_arcmin
         f.attrs["xray_instrument"] = CFG_XRAY.instrument
         f.attrs["xray_n_side"] = CFG_XRAY.n_side
+        f.attrs["xray_n_pointings"] = CFG_XRAY.n_side ** 2
         f.attrs["xray_step_arcmin"] = CFG_XRAY.step_arcmin
-        f.attrs["xray_t_exp_ks"] = CFG_XRAY.t_exp_ks
+        # Exposure is per sample now (attr xray_t_exp_ks on each group); these
+        # are the parameters of the distribution it is drawn from.
+        f.attrs["xray_t_exp_median_ks"] = CFG_XRAY.t_exp_median_ks
+        f.attrs["xray_t_exp_sigma_ln"] = CFG_XRAY.t_exp_sigma_ln
+        f.attrs["xray_t_exp_range_ks"] = np.array(
+            [CFG_XRAY.t_exp_min_ks, CFG_XRAY.t_exp_max_ks], dtype=np.float64)
+        f.attrs["xray_exposure_note"] = (
+            "LoVoCCS X-ray coverage is archival Chandra/XMM, so depth varies "
+            "cluster to cluster; each sample draws its own exposure and stores "
+            "the realised value as the group attr xray_t_exp_ks")
         f.attrs["xray_band_kev"] = np.array(
             [CFG_XRAY.band_emin_kev, CFG_XRAY.band_emax_kev], dtype=np.float64)
-        f.attrs["xray_z_bin_width"] = CFG_XRAY.z_bin_width
+        f.attrs["xray_redshift_note"] = (
+            "one photon list per sample, generated at that sample's exact "
+            "z_lens (config.sample_z_lens), so the group attrs xray_redshift "
+            "and z_lens are equal by construction")
         f.attrs["xray_nH_gal"] = CFG_XRAY.nH_gal
         f.attrs["xray_Z_met"] = CFG_XRAY.Z_met
         f.attrs["xray_maps"] = np.array(
@@ -1057,6 +1264,21 @@ def write_static_attrs(f: h5py.File):
             "cm^2 (SOXS-normalised, i.e. exposure map / exposure time), "
             "mean over the stored pixel")
 
+    # Intrinsic X-ray luminosity: a diagnostic against LoVoCCS's selection,
+    # never a cut on this dataset.
+    f.attrs["lx500c_band_kev"] = np.array(CFG_XRAY.lx_band_kev, dtype=np.float64)
+    f.attrs["lx500c_units"] = "erg s^-1, rest frame, inside R500c"
+    f.attrs["lx500c_note"] = (
+        "LoVoCCS selects L_X500c(0.1-2.4 keV) > 1e44 erg/s. This sample is "
+        "mass-selected, so lx500c_erg_s is recorded per sample for comparison "
+        "only; no simulated cluster is removed on it.")
+    f.attrs["lx500c_method"] = (
+        "sum of n_e n_H Lambda(T,Z) V over gas with T > T_min_K and "
+        "n_H < nH_max inside R500c, with Lambda the band-integrated APEC "
+        "energy cooling function (APEC v3.1.3 via soxs.spectra.ApecGenerator, "
+        "abund_table angr). R500c solved from the particles themselves as the "
+        "largest radius enclosing a mean density >= 500 rho_crit(z=0).")
+
 
 def write_sample_streaming(f: h5py.File, sample_id: int, sample: Dict):
     """Write everything that does not depend on train-set statistics."""
@@ -1064,6 +1286,10 @@ def write_sample_streaming(f: h5py.File, sample_id: int, sample: Dict):
     grp.attrs["id"] = int(sample_id)
     grp.attrs["simulation"] = sample["sim"]
     grp.attrs["cluster_index"] = int(sample["cluster_idx"])
+    # Identifies the sample to config.sample_z_lens and to the photon list it
+    # was observed from; samples land in the file in completion order, so this
+    # is the only way back to (simulation, cluster, projection).
+    grp.attrs["projection_index"] = int(sample["proj_index"])
     grp.attrs["cluster_mass"] = float(sample["halo_mass"])
     grp.attrs["n_galaxies"] = int(sample["n_gal"])
     grp.attrs["n_sources"] = int(sample["n_src"])
@@ -1099,6 +1325,17 @@ def write_sample_streaming(f: h5py.File, sample_id: int, sample: Dict):
     (grp.attrs["keep_frac_occult"],
      grp.attrs["keep_frac_pointing"],
      grp.attrs["keep_frac_total"]) = (float(v) for v in sample["keep_fracs"])
+    # Photo-z systematics, as scalars (z_true is deliberately not stored per
+    # source). src_true_foreground_frac is the dilution: sources whose BPZ point
+    # estimate cleared z_lens + 0.1 but whose true redshift is at or in front of
+    # the lens, and which therefore carry no shear.
+    grp.attrs["src_true_foreground_frac"] = float(sample["src_true_foreground_frac"])
+    grp.attrs["src_z_true_mean"] = float(sample["src_z_true_mean"])
+
+    # Intrinsic X-ray luminosity, for checking the sample against LoVoCCS's
+    # selection. Written whether or not the mock observation was made.
+    grp.attrs["lx500c_erg_s"] = float(sample["lx500c_erg_s"])
+    grp.attrs["r500c_mpc_over_h"] = float(sample["r500c_mpc_over_h"])
 
     xray = sample.get("xray")
     if xray is not None:
@@ -1110,6 +1347,8 @@ def write_sample_streaming(f: h5py.File, sample_id: int, sample: Dict):
         grp.attrs["xray_redshift"] = float(xray["xray_redshift"])
         grp.attrs["xray_fov_mpc"] = float(
             xray["xray_mpc_per_pix"] * CFG_XRAY.grid_size)
+        # Archival depth varies per cluster, so it is a per-sample attribute.
+        grp.attrs["xray_t_exp_ks"] = float(xray["xray_t_exp_ks"])
 
 
 def write_sample_targets(f: h5py.File, sample_id: int, cube, mass_log10, axes,
@@ -1140,30 +1379,47 @@ def main():
     if os.path.exists(out_path):
         os.remove(out_path)
 
-    # Empirical n(z) template, cut above z_lens_max so every source is
-    # background for any per-sample lens redshift.
+    # Empirical n(z) template. The background selection is per sample (the
+    # foreground cut moves with z_lens), so the template is kept whole and
+    # sorted here; lovoccs_background_template slices it per sample.
     z_raw = np.load(CFG_LENS.empirical_redshift_npz_path)[CFG_LENS.empirical_redshift_key]
     z_template = np.asarray(z_raw, dtype=np.float64)
-    z_template = z_template[z_template > CFG_LENS.z_lens_max]
-    if z_template.size == 0:
+    z_template = np.sort(z_template[np.isfinite(z_template)])
+    # The tightest cut any sample can apply, used only for the up-front check.
+    z_lo_max = CFG_LENS.z_lens_max + CFG_LENS.src_z_foreground_pad
+    n_worst = int(np.count_nonzero((z_template > z_lo_max)
+                                   & (z_template < CFG_LENS.src_z_max)))
+    if n_worst == 0:
         raise ValueError(
             f"empirical redshift template at {CFG_LENS.empirical_redshift_npz_path} "
-            f"(key={CFG_LENS.empirical_redshift_key!r}) has no entries above "
-            f"z_lens_max={CFG_LENS.z_lens_max}"
+            f"(key={CFG_LENS.empirical_redshift_key!r}) has no entries in "
+            f"({z_lo_max}, {CFG_LENS.src_z_max}), so the highest-z lens would "
+            f"have no background sources"
         )
     print(f"empirical n(z) [{CFG_LENS.empirical_template}]: {z_template.size} sources, "
           f"<z>={z_template.mean():.3f}, min={z_template.min():.3f}, "
           f"max={z_template.max():.3f}")
+    print(f"  LoVoCCS background cuts: z_lens + {CFG_LENS.src_z_foreground_pad} "
+          f"< z_s < {CFG_LENS.src_z_max}; {n_worst} sources "
+          f"({100.0 * n_worst / z_template.size:.1f}%) survive at the worst-case "
+          f"z_lens = {CFG_LENS.z_lens_max}")
     # TNG300 stellar mass / g-band pairs calibrating the BAHAMAS 'galaxy' cut.
     mag_calibration = load_tng_calibration()
     n_cal = int(np.sum(np.isfinite(mag_calibration[0]) & (mag_calibration[0] > 0)))
     print(f"galaxy cut: M_g <= {CFG_DATA.mag_cut_g} calibrated on "
           f"{'+'.join(CFG_DATA.tng_calibration_sims)} ({n_cal} subhalos with Mstar>0), "
           f"applied stochastically with seed={CFG_DATA.galaxy_cut_seed}")
-    print(f"lens redshift: z_l ~ U[{CFG_LENS.z_lens_min}, {CFG_LENS.z_lens_max}] per sample; "
-          f"n_source={CFG_LENS.n_source_per_arcmin2}/arcmin^2, "
+    print(f"lens redshift: z_l ~ U[{CFG_LENS.z_lens_min}, {CFG_LENS.z_lens_max}] per sample, "
+          f"keyed on (sim, cluster, projection) with z_lens_seed="
+          f"{CFG_LENS.z_lens_seed}; n_source={CFG_LENS.n_source_per_arcmin2}/arcmin^2, "
           f"shape grid {CFG_LENS.shape_grid_size}x{CFG_LENS.shape_grid_size} "
           f"over +/-{CFG_GRID.fov_mpc} Mpc")
+    if CFG_LENS.apply_photoz_error:
+        print(f"  BPZ photo-z error: sigma_z/(1+z)={CFG_LENS.bpz_sigma_z}, "
+              f"outlier rate {CFG_LENS.bpz_outlier_rate:.1%} redrawn from the "
+              f"full n(z); lensing uses z_true, the catalog reports z_phot")
+    else:
+        print("  BPZ photo-z error: DISABLED (z_phot == z_true)")
 
     cluster_inds = np.array([f"{i:03d}" for i in range(*CFG_DATA.cluster_index_range)])
     sims = list(CFG_DATA.simulations)
@@ -1178,10 +1434,14 @@ def main():
     for ci in cluster_inds:
         for sim in sims:
             npz_path = os.path.join(CFG_DATA.sim_data_root, sim, f"GrNm_{ci}.npz")
-            for _ in range(n_proj):
+            for pi in range(n_proj):
                 pv = rng.uniform(-1.0, 1.0, size=3)
                 pv = pv / max(np.linalg.norm(pv), 1e-12)
-                jobs.append((npz_path, sim, int(ci), pv,
+                # proj_index identifies the sample to xray_photons.py: it keys
+                # both the photon-list filename and z_lens. The viewing vector
+                # and the per-sample seed stay on this rng stream -- the photon
+                # list is a 3D object, so nothing about it depends on them.
+                jobs.append((npz_path, sim, int(ci), pi, pv,
                              int(rng.integers(0, 2 ** 31 - 1))))
 
     check_photon_lists(jobs)
