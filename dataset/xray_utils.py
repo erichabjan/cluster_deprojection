@@ -1,5 +1,7 @@
 """
-Mock Chandra ACIS-I mosaics of a BAHAMAS cluster, ported from
+Mock Chandra ACIS-I mosaics of a BAHAMAS (or FLAMINGO, via
+FLAMINGO/flamingo_io.py, which hands over the same fields in the same units)
+cluster, ported from
 Sandbox_notebooks/mock_xray_maps/init_xray_map_code.ipynb.
 
 Two changes from the notebook:
@@ -26,7 +28,8 @@ import pyxsim
 from yt.utilities.cosmology import Cosmology
 from astropy.io import fits
 
-from config import CFG_XRAY, CFG_COSMO, CFG_DATA
+from config import (CFG_XRAY, CFG_COSMO, CFG_DATA, BAHAMAS_BOXSIZE_MPC_OVER_H,
+                    cluster_boxsize_mpc_over_h)
 
 # --- physical constants (CGS), as in the notebook ---
 MP = 1.67262192369e-24        # proton mass, g
@@ -38,7 +41,11 @@ K_TO_KEV = 8.617333262e-8
 # Critical density at z=0 in Msun/Mpc^3, divided by h^2.
 RHO_CRIT_OVER_H2 = 2.77536627e11
 
-BOXSIZE_MPC_OVER_H = 400.0    # BAHAMAS box (cMpc/h)
+# BAHAMAS box (cMpc/h). Kept as the fallback only: every function below reads the
+# box from the loaded cluster (config.cluster_boxsize_mpc_over_h), so FLAMINGO's
+# 1 and 2.8 Gpc boxes wrap correctly while BAHAMAS files, which carry no box
+# size, still get 400.
+BOXSIZE_MPC_OVER_H = BAHAMAS_BOXSIZE_MPC_OVER_H
 
 # The sky-plane orientation pyXSIM gives a (normal, north_vector) pair, verified
 # against the projected gas mass by tests/check_xray_alignment.py:
@@ -55,7 +62,7 @@ def quiet_logs():
         logging.getLogger(name).setLevel(logging.ERROR)
 
 
-def bcg_index(data, boxsize=BOXSIZE_MPC_OVER_H) -> int:
+def bcg_index(data, boxsize=None) -> int:
     """
     Index of the BCG: the most massive stellar subhalo within
     CFG_DATA.bcg_search_radius_r200 * R200 of the FoF centre of potential.
@@ -64,6 +71,8 @@ def bcg_index(data, boxsize=BOXSIZE_MPC_OVER_H) -> int:
     identically. The aperture matters: a global argmax picks a neighbouring
     cluster's BCG, several Mpc away, in a handful of the 5 R200 cutouts.
     """
+    if boxsize is None:
+        boxsize = cluster_boxsize_mpc_over_h(data)
     sub_mstar = data["sub_massTotal"][:, 4]
     d_cop = data["sub_pos"] - data["CoP"]
     d_cop = (d_cop + 0.5 * boxsize) % boxsize - 0.5 * boxsize
@@ -104,7 +113,10 @@ def photon_prefix(sim, cluster_idx, proj_index, cfg=CFG_XRAY):
     Where the photon stage writes, and the dataset build reads, the photon list
     for one sample:
 
-        <photon_dir>/<sim>/<sim>_GrNm_<cluster>_p<projection>_photons.h5
+        <photon_dir>/<sim>/<sim>_<stem>_<cluster>_p<projection>_photons.h5
+
+    with <stem> = CFG_DATA.cluster_file_stem ('GrNm' for BAHAMAS, 'cluster'
+    for FLAMINGO), matching the cluster file the list was made from.
 
     Keyed on the sample's identity, not on its redshift: two projections of a
     cluster can draw z_lens values that agree to four decimals, and a
@@ -115,8 +127,9 @@ def photon_prefix(sim, cluster_idx, proj_index, cfg=CFG_XRAY):
     The model name is repeated in the filename even though the directory already
     carries it, so a list stays identifiable if it is ever copied out on its own.
     """
+    stem = CFG_DATA.cluster_file_stem
     return os.path.join(photon_sim_dir(sim, cfg),
-                        f"{sim}_GrNm_{cluster_idx:03d}_p{int(proj_index):d}_photons")
+                        f"{sim}_{stem}_{cluster_idx:03d}_p{int(proj_index):d}_photons")
 
 
 def photon_list_redshift(prefix):
@@ -143,10 +156,16 @@ def density_unit_cgs(h, a):
     return (1.0e10 * MSUN / h) / (MPC / h) ** 3 / a ** 3
 
 
-def bahamas_cosmology(h):
+def bahamas_cosmology(h, Om0=None):
+    """
+    The simulation's flat cosmology for yt/pyXSIM. Om0 defaults to the BAHAMAS
+    value; FLAMINGO passes each run's own (config.sim_cosmology).
+    """
+    if Om0 is None:
+        Om0 = CFG_COSMO.Om0_sim
     return Cosmology(hubble_constant=h,
-                     omega_matter=CFG_COSMO.Om0_sim,
-                     omega_lambda=1.0 - CFG_COSMO.Om0_sim)
+                     omega_matter=Om0,
+                     omega_lambda=1.0 - Om0)
 
 
 def load_gas_dataset(data, center, cfg=CFG_XRAY):
@@ -156,7 +175,7 @@ def load_gas_dataset(data, center, cfg=CFG_XRAY):
 
     `center` is in comoving Mpc/h, like data['sub_pos'].
     """
-    BOX = BOXSIZE_MPC_OVER_H
+    BOX = cluster_boxsize_mpc_over_h(data)
 
     h = float(data["h"])
     a = float(data["a"])
@@ -285,7 +304,7 @@ def r500c_mpc_over_h(data, center, cfg=CFG_XRAY):
     """
     h = float(data["h"])
     a = float(data["a"])
-    BOX = BOXSIZE_MPC_OVER_H
+    BOX = cluster_boxsize_mpc_over_h(data)
 
     r_list, m_list = [], []
     for pos_key, mass_key in (("dm_pos", "dm_mass"), ("gas_pos", "gas_mass"),
@@ -335,7 +354,7 @@ def lx500c_erg_s(data, center, cfg=CFG_XRAY):
     """
     h = float(data["h"])
     a = float(data["a"])
-    BOX = BOXSIZE_MPC_OVER_H
+    BOX = cluster_boxsize_mpc_over_h(data)
 
     r500 = r500c_mpc_over_h(data, center, cfg)
     if not np.isfinite(r500):
@@ -560,14 +579,17 @@ def arcsec_per_pixel(cfg=CFG_XRAY):
     return cfg.fov_arcmin * 60.0 / cfg.grid_size
 
 
-def mpc_per_pixel(redshift, h, cfg=CFG_XRAY):
-    """Physical Mpc per stored pixel at the sample's redshift (BAHAMAS cosmology)."""
-    cosmo = bahamas_cosmology(h)
+def mpc_per_pixel(redshift, h, cfg=CFG_XRAY, Om0=None):
+    """
+    Physical Mpc per stored pixel at the sample's redshift, in the simulation's
+    cosmology (BAHAMAS unless Om0 is given).
+    """
+    cosmo = bahamas_cosmology(h, Om0)
     D_A = float(cosmo.angular_diameter_distance(0.0, redshift).to("Mpc").d)
     return arcsec_per_pixel(cfg) * (np.pi / 180.0 / 3600.0) * D_A
 
 
-def build_sample_maps(products, redshift, h, cfg=CFG_XRAY):
+def build_sample_maps(products, redshift, h, cfg=CFG_XRAY, Om0=None):
     """
     Turn the FITS products into the small arrays the dataset stores.
 
@@ -617,7 +639,7 @@ def build_sample_maps(products, redshift, h, cfg=CFG_XRAY):
         "xray_mosaic": mosaic.astype(np.float32),
         "xray_ideal": ideal.astype(np.float32),
         "xray_arcsec_per_pix": np.float32(pix_arcsec),
-        "xray_mpc_per_pix": np.float32(mpc_per_pixel(redshift, h, cfg)),
+        "xray_mpc_per_pix": np.float32(mpc_per_pixel(redshift, h, cfg, Om0)),
         # float64 to match the group's z_lens attr exactly: the photon list was
         # generated at that redshift, and the two should compare equal.
         "xray_redshift": np.float64(redshift),

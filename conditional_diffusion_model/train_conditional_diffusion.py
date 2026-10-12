@@ -29,6 +29,19 @@ def preload_hdf5_to_memory(file_path: str) -> Dict[str, np.ndarray]:
                          cell c holds src_features[i][ptr[i,c]:ptr[i,c+1]]
     with S = metadata["shape_grid_size"]. Old h5 files without source data
     load fine; the src_* / z_lens / n_sources keys are simply absent.
+
+    The mock-Chandra maps are fixed-shape, so they stack densely:
+      xray_maps    : (n_samples, G, G, 4) float32, channels
+                     [mosaic_z, counts_z, xray_mask, density_mask]
+      xray_scalars : (n_samples, 3) float32, [z_lens, log10 t_exp_ks,
+                     log10 xray_mpc_per_pix]
+    mosaic and counts are already log10 z-scored by the dataset build.
+    density_mask is expmap > 0 -- whether the pixel was observed at all --
+    which is what separates the ~24% of the frame off the ACIS-I footprint
+    from a genuine non-detection; xray_mask cannot, since it folds expmap > 0
+    in already. Presence is keyed on xray_mask rather than xray_mosaic, so a
+    pre-standardization file (raw maps, no mask) is skipped rather than fed to
+    the model on the wrong scale.
     """
     print(f"\nPreloading {file_path} into memory...")
     start = time.time()
@@ -57,6 +70,14 @@ def preload_hdf5_to_memory(file_path: str) -> Dict[str, np.ndarray]:
             z_lens = np.zeros((n_samples,), dtype=np.float32)
             n_sources = np.zeros((n_samples,), dtype=np.int64)
 
+        # xray_mask exists only in standardized files, so it is the right test:
+        # it guarantees mosaic/counts are the log10 z-scores XrayEncoder expects.
+        has_xray = "xray_mask" in first
+        if has_xray:
+            G = int(first["xray_mosaic"].shape[0])
+            xray_maps = np.zeros((n_samples, G, G, 4), dtype=np.float32)
+            xray_scalars = np.zeros((n_samples, 3), dtype=np.float32)
+
         for i, sid in enumerate(sample_ids):
             g = f[sid]
             images[i] = g["images"][:]
@@ -74,6 +95,18 @@ def preload_hdf5_to_memory(file_path: str) -> Dict[str, np.ndarray]:
                 src_cell_ptr[i] = g["src_cell_ptr"][:]
                 z_lens[i] = g.attrs["z_lens"]
                 n_sources[i] = g.attrs["n_sources"]
+            if has_xray:
+                xray_maps[i, ..., 0] = g["xray_mosaic"][:]
+                xray_maps[i, ..., 1] = g["xray_counts"][:]
+                xray_maps[i, ..., 2] = g["xray_mask"][:]
+                xray_maps[i, ..., 3] = g["xray_expmap"][:] > 0.0   # density_mask
+                # Raw, not rescaled: XrayEncoder does its own O(1) scaling, and
+                # it reconstructs the pixel scale as 10**scalars[:, 2].
+                xray_scalars[i] = (
+                    g.attrs["z_lens"],
+                    np.log10(g.attrs["xray_t_exp_ks"]),
+                    np.log10(g.attrs["xray_mpc_per_pix"]),
+                )
 
         metadata = {k: f.attrs[k] for k in f.attrs.keys()}
 
@@ -91,12 +124,22 @@ def preload_hdf5_to_memory(file_path: str) -> Dict[str, np.ndarray]:
         size_b += (sum(a.nbytes for a in src_features)
                    + sum(a.nbytes for a in src_cell_id)
                    + src_cell_ptr.nbytes)
+    if has_xray:
+        size_b += xray_maps.nbytes + xray_scalars.nbytes
     print(f"✓ Loaded {n_samples} samples in {elapsed:.2f}s ({size_b / 1e9:.2f} GB)")
     if has_src:
         print(f"  sources/sample: min={n_sources.min()}, "
               f"median={int(np.median(n_sources))}, max={n_sources.max()}; "
               f"shape grid {int(metadata['shape_grid_size'])}"
               f"x{int(metadata['shape_grid_size'])}")
+    if has_xray:
+        det = xray_maps[..., 2].mean(axis=(1, 2))
+        obs = xray_maps[..., 3].mean(axis=(1, 2))
+        t_exp = 10.0 ** xray_scalars[:, 1]
+        print(f"  xray {G}x{G} ({xray_maps.nbytes / 1e9:.2f} GB): detected frac "
+              f"min={det.min():.3f}, median={np.median(det):.3f}, max={det.max():.3f}; "
+              f"observed frac median={np.median(obs):.3f}; "
+              f"t_exp {t_exp.min():.0f}-{t_exp.max():.0f} ks")
 
     out = dict(
         images=images,
@@ -118,6 +161,8 @@ def preload_hdf5_to_memory(file_path: str) -> Dict[str, np.ndarray]:
             z_lens=z_lens,
             n_sources=n_sources,
         )
+    if has_xray:
+        out.update(xray_maps=xray_maps, xray_scalars=xray_scalars)
     return out
 
 
@@ -193,6 +238,17 @@ def data_loader(
         src_features, src_cell_id, src_log_count = make_src_batch(
             data, bidx, n_src_pad, grid_size)
 
+        # Already batch-ready, so no assembly helper is needed. A file without
+        # X-ray yields None, which jax treats as an empty pytree node: it
+        # passes through jit and reaches XrayEncoder's `is not None` guard,
+        # at the cost of one extra compile for that batch shape.
+        if "xray_maps" in data:
+            xray_maps = jnp.asarray(data["xray_maps"][bidx])       # (B,G,G,4)
+            xray_scalars = jnp.asarray(data["xray_scalars"][bidx])  # (B,3)
+        else:
+            xray_maps = None
+            xray_scalars = None
+
         yield (
             jnp.asarray(images),
             jnp.asarray(cubes),
@@ -202,6 +258,8 @@ def data_loader(
             jnp.asarray(src_features),
             jnp.asarray(src_cell_id),
             jnp.asarray(src_log_count),
+            xray_maps,
+            xray_scalars,
         )
 
 
@@ -228,7 +286,8 @@ def q_sample(x0, t, noise, alpha_bars):
 
 def create_train_state(model, rng_key, learning_rate, grad_clipping, example_batch):
     (images_ex, cubes_ex, gal_features_ex, gal_pixel_coords_ex, mask_ex,
-     src_features_ex, src_cell_id_ex, src_log_count_ex) = example_batch
+     src_features_ex, src_cell_id_ex, src_log_count_ex,
+     xray_maps_ex, xray_scalars_ex) = example_batch
     B = cubes_ex.shape[0]
     t_ex = jnp.zeros((B,), dtype=jnp.int32)
 
@@ -243,6 +302,8 @@ def create_train_state(model, rng_key, learning_rate, grad_clipping, example_bat
         src_features=src_features_ex,
         src_cell_id=src_cell_id_ex,
         src_log_count=src_log_count_ex,
+        xray_maps=xray_maps_ex,
+        xray_scalars=xray_scalars_ex,
     )["params"]
 
     tx = optax.chain(
@@ -263,6 +324,8 @@ def diffusion_loss(
     src_features,
     src_cell_id,
     src_log_count,
+    xray_maps,
+    xray_scalars,
     timesteps,
     noise,
     alpha_bars,
@@ -282,6 +345,8 @@ def diffusion_loss(
         src_features=src_features,
         src_cell_id=src_cell_id,
         src_log_count=src_log_count,
+        xray_maps=xray_maps,
+        xray_scalars=xray_scalars,
     )
     #weights = jnp.where(cubes <= floor_value + 1e-6, bg_weight, fg_weight)
     #sqerr = (pred_noise - noise) ** 2
@@ -292,6 +357,7 @@ def diffusion_loss(
 @jax.jit
 def train_step(state, images, cubes, gal_features, gal_pixel_coords, mask,
                src_features, src_cell_id, src_log_count,
+               xray_maps, xray_scalars,
                rng_key, alpha_bars, num_timesteps):
     rng_t, rng_n = jax.random.split(rng_key, 2)
     B = cubes.shape[0]
@@ -310,6 +376,8 @@ def train_step(state, images, cubes, gal_features, gal_pixel_coords, mask,
             src_features,
             src_cell_id,
             src_log_count,
+            xray_maps,
+            xray_scalars,
             t,
             noise,
             alpha_bars,
@@ -324,6 +392,7 @@ def train_step(state, images, cubes, gal_features, gal_pixel_coords, mask,
 @jax.jit
 def eval_step(state, images, cubes, gal_features, gal_pixel_coords, mask,
               src_features, src_cell_id, src_log_count,
+              xray_maps, xray_scalars,
               rng_key, alpha_bars, num_timesteps):
     rng_t, rng_n = jax.random.split(rng_key, 2)
     B = cubes.shape[0]
@@ -341,6 +410,8 @@ def eval_step(state, images, cubes, gal_features, gal_pixel_coords, mask,
         src_features,
         src_cell_id,
         src_log_count,
+        xray_maps,
+        xray_scalars,
         t,
         noise,
         alpha_bars,
@@ -362,6 +433,8 @@ def sample_ddpm(
     betas,
     alphas,
     alpha_bars,
+    xray_maps=None,
+    xray_scalars=None,
 ):
     """
     cond_images:      (B,H,W,C)
@@ -372,6 +445,11 @@ def sample_ddpm(
     src_cell_id:      (B,Ns)
     src_log_count:    (B,S,S,1)
     sample_shape:     (B,Z,Y,X,1)
+    xray_maps:        (B,G,G,4) or None
+    xray_scalars:     (B,3) or None
+
+    Keyword-only at the end so existing positional callers keep working; pass
+    both if the checkpoint was trained with the X-ray branch.
     """
     x = jax.random.normal(rng_key, shape=sample_shape)
 
@@ -390,6 +468,8 @@ def sample_ddpm(
             src_features=src_features,
             src_cell_id=src_cell_id,
             src_log_count=src_log_count,
+            xray_maps=xray_maps,
+            xray_scalars=xray_scalars,
         )
 
         beta_t = betas[step]

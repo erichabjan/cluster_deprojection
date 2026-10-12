@@ -68,9 +68,21 @@ projection vector rotates both the cluster members and the matter particles):
       xray_counts (G,G): counts
       xray_expmap (G,G): mean exposure map, cm^2 (SOXS normalises out the time)
       xray_ideal  (G,G): the same band with no instrument, PSF or background
+      xray_mask   (G,G): 1.0 where the pixel is usable, 0.0 where it is not
     plus the group attrs xray_t_exp_ks (the realised depth) and lx500c_erg_s
     (intrinsic 0.1-2.4 keV luminosity inside R500c, for comparison against
     LoVoCCS's L_X > 1e44 erg/s selection -- a diagnostic, never a cut).
+
+    The two model-facing maps are stored ready to train on rather than raw.
+    xray_mask marks the pixels that carry information -- the detector looked
+    there (xray_expmap > 0) and a photon landed (counts > CFG_XRAY.min_counts,
+    which also drops the sub-count reprojection leakage soxs leaves over ~10%
+    of the field) -- and on those pixels xray_mosaic and xray_counts hold
+    log10 z-scores against the fixed constants in CFG_XRAY, 0 elsewhere. Both
+    span ~4 decades over a large spike at zero, so a linear z-score would leave
+    99% of pixels at ~0 and the core at +100 sigma. The raw values invert from
+    the stored ones (see the xray_standardization file attr), so they are not
+    written twice; xray_expmap and xray_ideal stay in physical units.
 
 Prerequisites:
   - build_lovoccs_redshift_template.py (run once) when
@@ -850,6 +862,49 @@ def build_xray_maps(sim, cluster_idx, proj_index, proj_vec, z_lens, h_sim,
         maps = xu.build_sample_maps(products, z_lens, h_sim)
     finally:
         xu.clean_intermediates(work_prefix)     # never touches the photon list
+    return standardize_xray_maps(maps)
+
+
+def standardize_xray_maps(maps):
+    """
+    Put xray_mosaic and xray_counts into the form the model consumes, in place:
+    a validity mask, and log10 z-scores on the pixels that mask keeps.
+
+    Only the pixels where the detector looked (xray_expmap > 0) and a photon
+    landed (xray_counts > CFG_XRAY.min_counts) carry information; everywhere
+    else log10 is either undefined or would be reporting reprojection leakage
+    (see CFG_XRAY.min_counts). Those pixels become
+
+        (log10(x) - <log10 x>) / sigma(log10 x)
+
+    with the constants fixed in CFG_XRAY, and the rest are set to 0 -- a filler
+    the mask tells the model to ignore, not a measurement of an empty pixel.
+
+    The raw maps are not kept alongside these: xray_counts inverts exactly as
+    10**(z * std + mean), and xray_mosaic is that divided by
+    xray_expmap * t_exp_s * arcsec_per_pix^2, so nothing is lost.
+
+    xray_expmap and xray_ideal are left in physical units.
+    """
+    counts = maps["xray_counts"].astype(np.float64)
+    expmap = maps["xray_expmap"].astype(np.float64)
+    mosaic = maps["xray_mosaic"].astype(np.float64)
+
+    # 1.0 = usable, matching the polarity of the `mask` dataset on the member
+    # point cloud. Both criteria are needed to make the log10s below finite.
+    valid = (expmap > 0.0) & (counts > CFG_XRAY.min_counts)
+
+    def _log10_zscore(x, mean, std):
+        out = np.zeros(x.shape, dtype=np.float32)
+        if np.any(valid):
+            out[valid] = ((np.log10(x[valid]) - mean) / std).astype(np.float32)
+        return out
+
+    maps["xray_mosaic"] = _log10_zscore(
+        mosaic, CFG_XRAY.mosaic_log10_mean, CFG_XRAY.mosaic_log10_std)
+    maps["xray_counts"] = _log10_zscore(
+        counts, CFG_XRAY.counts_log10_mean, CFG_XRAY.counts_log10_std)
+    maps["xray_mask"] = valid.astype(np.float32)
     return maps
 
 
@@ -1256,13 +1311,43 @@ def write_static_attrs(f: h5py.File):
         f.attrs["xray_nH_gal"] = CFG_XRAY.nH_gal
         f.attrs["xray_Z_met"] = CFG_XRAY.Z_met
         f.attrs["xray_maps"] = np.array(
-            [b"xray_mosaic", b"xray_counts", b"xray_expmap", b"xray_ideal"], dtype="S16")
-        f.attrs["xray_mosaic_units"] = "counts s^-1 cm^-2 arcsec^-2 (exposure corrected)"
+            [b"xray_mosaic", b"xray_counts", b"xray_expmap", b"xray_ideal",
+             b"xray_mask"], dtype="S16")
+        # xray_mosaic and xray_counts are stored model-ready: log10, z-scored
+        # with the constants below, and zeroed wherever xray_mask is 0.
+        f.attrs["xray_min_counts"] = CFG_XRAY.min_counts
+        f.attrs["xray_mosaic_log10_mean"] = CFG_XRAY.mosaic_log10_mean
+        f.attrs["xray_mosaic_log10_std"] = CFG_XRAY.mosaic_log10_std
+        f.attrs["xray_counts_log10_mean"] = CFG_XRAY.counts_log10_mean
+        f.attrs["xray_counts_log10_std"] = CFG_XRAY.counts_log10_std
+        f.attrs["xray_mask_definition"] = (
+            "1.0 where the pixel is usable, 0.0 where it is not -- same "
+            "polarity as the `mask` dataset on the member point cloud. Usable "
+            "means xray_expmap > 0 (the detector looked there) and raw counts "
+            "> xray_min_counts (a photon landed, and the value is not the "
+            "sub-count reprojection leakage soxs.make_mosaic_image leaves over "
+            "~10% of the field). Only these pixels should enter the model's "
+            "embeddings; xray_mosaic and xray_counts are 0 elsewhere, which is "
+            "filler rather than a measurement.")
+        f.attrs["xray_standardization"] = (
+            "xray_mosaic and xray_counts hold (log10(raw) - mean) / std over "
+            "the valid pixels, using xray_{mosaic,counts}_log10_{mean,std}. "
+            "Raw counts come back as 10**(xray_counts * std + mean); raw "
+            "surface brightness likewise, and equals those counts divided by "
+            "xray_expmap * (1e3 * xray_t_exp_ks) * xray_arcsec_per_pix**2. The "
+            "raw maps are therefore not stored a second time.")
+        f.attrs["xray_mosaic_units"] = (
+            "dimensionless, log10 z-scored (see xray_standardization); the "
+            "underlying map is counts s^-1 cm^-2 arcsec^-2, exposure corrected")
+        f.attrs["xray_counts_units"] = (
+            "dimensionless, log10 z-scored (see xray_standardization); the "
+            "underlying map is counts per stored pixel")
         f.attrs["xray_ideal_units"] = (
-            "counts s^-1 cm^-2 arcsec^-2, no instrument, PSF or background")
+            "counts s^-1 cm^-2 arcsec^-2, no instrument, PSF or background "
+            "(raw, not standardized)")
         f.attrs["xray_expmap_units"] = (
             "cm^2 (SOXS-normalised, i.e. exposure map / exposure time), "
-            "mean over the stored pixel")
+            "mean over the stored pixel (raw, not standardized)")
 
     # Intrinsic X-ray luminosity: a diagnostic against LoVoCCS's selection,
     # never a cut on this dataset.
@@ -1339,8 +1424,10 @@ def write_sample_streaming(f: h5py.File, sample_id: int, sample: Dict):
 
     xray = sample.get("xray")
     if xray is not None:
-        for name in ("xray_mosaic", "xray_counts", "xray_expmap", "xray_ideal"):
+        for name in ("xray_mosaic", "xray_counts", "xray_expmap", "xray_ideal",
+                     "xray_mask"):
             grp.create_dataset(name, data=xray[name], compression="gzip")   # (G,G)
+        grp.attrs["xray_valid_frac"] = float(np.mean(xray["xray_mask"]))
         # Fixed angular grid, so the physical scale is per sample.
         grp.attrs["xray_mpc_per_pix"] = float(xray["xray_mpc_per_pix"])
         grp.attrs["xray_arcsec_per_pix"] = float(xray["xray_arcsec_per_pix"])

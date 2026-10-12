@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Sequence, Callable
+from typing import Sequence, Callable, Optional
 
 import jax
 import jax.numpy as jnp
@@ -317,6 +317,121 @@ class SourceShapeEncoder(nn.Module):
         return h
 
 
+class XrayEncoder(nn.Module):
+    """
+    Mock-Chandra X-ray branch.
+
+    Unlike every other input, the X-ray maps live on a fixed *angular* grid
+    (a 20' ACIS-I field), while cond_images and the shape grid are on a fixed
+    *physical* +/-fov_mpc grid. The X-ray field is therefore only 0.7-2.6 Mpc
+    across depending on z_lens -- 7-26% of the conditioning FoV.
+
+    A per-pixel MLP embeds it, and the embeddings are mean-pooled
+    into whichever cell of the conditioning grid the pixel physically lands in.
+    The MLP needs no xy input -- it is a learned reprojection of one pixel's
+    photometry.
+
+    Most conditioning cells fall outside the X-ray field entirely. Rather than
+    zero-filling them, the same MLP is evaluated once per sample on a 
+    out-of-range brightnesses; so, 'no data' is a value the network picks rather
+    than an arbitrary zero.
+
+    Two mask bits separate the three states a pixel can be in:
+
+      xray_mask=1, density_mask=1  detected: expmap > 0 and counts > min_counts
+      xray_mask=0, density_mask=1  observed but dark
+      xray_mask=0, density_mask=0  never observed
+
+    This econder scales with the dimension size of the output cube
+    """
+    embed_dim: int          # per-pixel embedding length (cfg.xray_embed_dim)
+    out_ch: int             # channels of the reduced feature map
+    grid_size: int          # G: Chandra grid resolution (cfg.xray_grid_size)
+    target_size: int        # output resolution, matches the conditioning images
+    fov_mpc: float          # half-extent of the conditioning grid (cfg.map_fov_mpc)
+    # Both maps are stored log10 z-scored. Over the valid pixels those z-scores
+    # span [-1.0, +7.0] (counts) and [-1.9, +6.5] (mosaic), so -5 is clear of
+    # both and is only ever the address of the learned no-data token, never a
+    # brightness. log10(0 counts) is -inf, so a sentinel is required regardless.
+    sentinel_z: float = -5.0
+    activation: Callable = nn.gelu
+
+    @nn.compact
+    def __call__(
+        self,
+        xray_maps: jnp.ndarray,
+        xray_scalars: jnp.ndarray,
+    ) -> jnp.ndarray:
+        """
+        xray_maps:    (B, G, G, 4)  mosaic_z, counts_z, xray_mask, density_mask
+                                    (mosaic/counts already log10 z-scored by the
+                                    dataset build; both masks are 0/1)
+        xray_scalars: (B, 3)        z_lens, log10 t_exp_ks, log10 mpc_per_pix (raw)
+
+        returns: (B, target_size, target_size, out_ch)
+        """
+        B = xray_maps.shape[0]
+        G = self.grid_size
+        T = self.target_size
+        n_seg = T * T
+
+        scal = jnp.stack([
+            (xray_scalars[:, 0] - 0.075) / 0.026,     # z_lens
+            (xray_scalars[:, 1] - 1.5) / 0.25,        # log10 t_exp_ks
+            (xray_scalars[:, 2] + 2.0) / 0.3,         # log10 mpc_per_pix
+        ], axis=-1)                                                   # (B,3)
+
+
+        mpc_per_pix = 10.0 ** xray_scalars[:, 2]                      # (B,)
+        off = jnp.arange(G, dtype=jnp.float32) + 0.5 - 0.5 * G        # (G,)
+        d_mpc = off[None, :] * mpc_per_pix[:, None]                   # (B,G) from centre
+        idx = jnp.floor((d_mpc + self.fov_mpc) / (2.0 * self.fov_mpc) * T)
+        idx = jnp.clip(idx, 0, T - 1).astype(jnp.int32)               # (B,G)
+
+        cell_id = (idx[:, :, None] * T + idx[:, None, :]).reshape(B, G * G)
+
+        m = xray_maps.reshape(B, G * G, 4)
+        tokens = jnp.concatenate(
+            [m, jnp.broadcast_to(scal[:, None, :], (B, G * G, 3))], axis=-1)
+
+        pixel_mlp = MLP([2 * self.embed_dim, self.embed_dim], activate_last=True)
+        emb = pixel_mlp(tokens)                                       # (B,GG,E)
+
+        sentinel_in = jnp.concatenate([
+            jnp.full((B, 2), self.sentinel_z, dtype=tokens.dtype),    # mosaic, counts
+            jnp.zeros((B, 2), dtype=tokens.dtype),                    # both mask bits
+            scal.astype(tokens.dtype),
+        ], axis=-1)                                                   # (B,7)
+        sentinel = pixel_mlp(sentinel_in)                             # (B,E)
+
+        detected = m[..., 2]                                          # (B,GG)
+
+        def pool(e, cid, det):
+            ones = jnp.ones_like(det)
+            return (jax.ops.segment_sum(e, cid, num_segments=n_seg),
+                    jax.ops.segment_sum(ones, cid, num_segments=n_seg),
+                    jax.ops.segment_sum(det, cid, num_segments=n_seg))
+
+        sums, n_tok, n_det = jax.vmap(pool)(emb, cell_id, detected)
+
+        mean = sums / jnp.maximum(n_tok, 1.0)[..., None]              # (B,T*T,E)
+        # Cells the X-ray field never reaches take the learned baseline.
+        h = jnp.where((n_tok > 0)[..., None], mean, sentinel[:, None, :])
+
+        # How much of the cell was actually detected 
+        log_n_det = jnp.log1p(n_det)[..., None] / jnp.log1p(float(G * G))
+        frac_det = (n_det / jnp.maximum(n_tok, 1.0))[..., None]
+        h = jnp.concatenate([h, log_n_det, frac_det], axis=-1)        # (B,T*T,E+2)
+        h = h.reshape(B, T, T, self.embed_dim + 2)                    # [iy, ix]
+
+        h = nn.Conv(self.out_ch, kernel_size=(3, 3), padding="SAME")(h)
+        h = nn.GroupNorm(num_groups=min(8, self.out_ch))(h)
+        h = self.activation(h)
+        h = nn.Conv(self.out_ch, kernel_size=(3, 3), padding="SAME")(h)
+        h = self.activation(h)
+        return h
+
+
 class QueryCrossAttention3D(nn.Module):
     query_dim: int
     num_heads: int
@@ -441,6 +556,16 @@ class DiffusionModelConfig:
     src_out_ch: int = 32          # channels of the reduced shear feature map
     shape_grid_size: int = 128    # S: source cell grid (h5 attr 'shape_grid_size')
 
+    # Mock-Chandra X-ray branch (shape_dynamics dataset)
+    xray_embed_dim: int = 32      # per-pixel embedding length
+    xray_out_ch: int = 32         # channels of the reduced xray feature map
+    xray_grid_size: int = 128     # G: Chandra grid (h5 attr 'xray_grid_size')
+    xray_sentinel_z: float = -5.0  # log10 z-score standing for 'no data'
+    # Half-extent of the conditioning/shape grids, in Mpc (h5 attr
+    # 'map_fov_mpc'). The X-ray branch needs it because its own grid is
+    # angular: it is what converts xray_mpc_per_pix into a cell index.
+    map_fov_mpc: float = 5.0
+
 
 class ConditionalUNet3D(nn.Module):
     cfg: DiffusionModelConfig
@@ -457,6 +582,8 @@ class ConditionalUNet3D(nn.Module):
         src_features: jnp.ndarray,
         src_cell_id: jnp.ndarray,
         src_log_count: jnp.ndarray,
+        xray_maps: Optional[jnp.ndarray] = None,
+        xray_scalars: Optional[jnp.ndarray] = None,
     ) -> jnp.ndarray:
         """
         noisy_cube:       (B, Z, Y, X, 1)      e.g. (B,16,16,16,1)
@@ -468,6 +595,9 @@ class ConditionalUNet3D(nn.Module):
         src_features:     (B, Ns, 7)           e1, e2, ix, iy, z_s, z_lens, cell_frac
         src_cell_id:      (B, Ns)              int32; padded rows = shape_grid_size**2
         src_log_count:    (B, S, S, 1)         log1p(sources per shape-grid cell)
+        xray_maps:        (B, G, G, 4)         mosaic_z, counts_z, xray_mask,
+                                               density_mask; None disables the branch
+        xray_scalars:     (B, 3)               z_lens, log10 t_exp_ks, log10 mpc_per_pix
         """
         time_emb = sinusoidal_time_embedding(timesteps, self.cfg.time_emb_dim)
         time_emb = MLP(
@@ -488,7 +618,26 @@ class ConditionalUNet3D(nn.Module):
             grid_size=self.cfg.shape_grid_size,
             target_size=cond_images.shape[1],
         )(src_features, src_cell_id, src_log_count)     # (B,H,W,src_out_ch)
-        cond_images = jnp.concatenate([cond_images, shear2d], axis=-1)
+
+        # ------------------------------------------------------------
+        # Mock-Chandra X-ray branch -> the same 2D feature map. Optional, so a
+        # dynamics/lensing-only dataset still runs; see XrayEncoder for why it
+        # scatters by physical position instead of striding like the branch
+        # above.
+        # ------------------------------------------------------------
+        extra_2d = [shear2d]
+        if xray_maps is not None:
+            xray2d = XrayEncoder(
+                embed_dim=self.cfg.xray_embed_dim,
+                out_ch=self.cfg.xray_out_ch,
+                grid_size=self.cfg.xray_grid_size,
+                target_size=cond_images.shape[1],
+                fov_mpc=self.cfg.map_fov_mpc,
+                sentinel_z=self.cfg.xray_sentinel_z,
+            )(xray_maps, xray_scalars)                  # (B,H,W,xray_out_ch)
+            extra_2d.append(xray2d)
+
+        cond_images = jnp.concatenate([cond_images, *extra_2d], axis=-1)
 
         # ------------------------------------------------------------
         # 2D image branch

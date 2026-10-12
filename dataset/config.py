@@ -8,6 +8,13 @@ Pipeline (each stage has its own slurm script):
 Merges the pieces of jaxlense_dataset/config.py and
 conditional_diffusion_model/conditional_diffusion_data.py that this
 pipeline actually uses.
+
+Simulation suites: the CFG_* objects below default to BAHAMAS. Setting the
+environment variable CLUSTER_SUITE=FLAMINGO *before* this module is first
+imported swaps CFG_DATA, CFG_COSMO and CFG_XRAY for their FLAMINGO versions
+(see the bottom of the file); dataset/FLAMINGO/*.py set it themselves. Every
+other setting -- grids, scalings, lensing, the X-ray source model and
+observation -- is shared, so the two suites are built identically.
 """
 import zlib
 from dataclasses import dataclass
@@ -252,6 +259,31 @@ class XrayConfig:
     grid_size: int = 128
     fov_arcmin: float = 20.0
 
+    # --- model-facing normalization -----------------------------------------
+    # xray_mosaic and xray_counts are stored z-scored in log10 rather than raw:
+    # both span ~4 decades with a large spike at zero, so a linear z-score would
+    # leave 99% of pixels at ~0 and the core at +100 sigma.
+    #
+    # A pixel is usable only where the detector actually looked *and* a photon
+    # actually landed. counts < min_counts also throws out the sub-count
+    # reprojection leakage that soxs.make_mosaic_image leaves behind (~10% of
+    # the field carries values of order 1e-26 counts, which log10 would send to
+    # -26 and which are not photons); after the cut every surviving pixel has
+    # counts >= 1, so log10 is finite everywhere it is evaluated.
+    #
+    # The two criteria are nearly redundant -- no exposure means no counts, so
+    # the counts cut subsumes all but ~0.03% of the exposure cut -- but the
+    # exposure cut is kept as the cheap statement of where the field is.
+    min_counts: float = 0.5
+    # Round numbers, not fitted: measured over 400 samples the valid-pixel log10
+    # mosaic is (mean -7.97, std 0.486) and log10 counts is (mean 0.491, std
+    # 0.487). Held fixed so the constants do not move when other simulation
+    # suites join the split.
+    mosaic_log10_mean: float = -8.0
+    mosaic_log10_std: float = 0.5
+    counts_log10_mean: float = 0.5
+    counts_log10_std: float = 0.5
+
     # --- intrinsic X-ray luminosity (diagnostic, never a cut) ---------------
     # LoVoCCS selects on L_X500c > 1e44 erg/s in 0.1-2.4 keV. The BAHAMAS sample
     # is mass-selected, so L_X500c is recorded per cluster to let that selection
@@ -291,13 +323,29 @@ class DatasetConfig:
     simulations: Tuple[str, ...] = ("CDMb", "SIDM0.1b", "SIDM0.3b", "SIDM1b", "vdSIDMb")
     cluster_index_range: Tuple[int, int] = (1, 101)        # 1..100 inclusive
     sim_data_root: str = "/projects/mccleary_group/habjan.e/TNG/Data/"
-    max_nodes: int = 700                 # cluster-member padded length
+    # Per-cluster files are <sim_data_root>/<sim>/<cluster_file_stem>_<idx:03d>.npz;
+    # the stem also names the photon lists (xray_utils.photon_prefix).
+    cluster_file_stem: str = "GrNm"
+    # Cluster-member padded length, shared by every suite so the prior spans
+    # the full range of cluster sizes. Members beyond max_nodes would be
+    # dropped in catalogue order, so it sits above the largest count passing
+    # the g-band cut anywhere: 2603 (FLAMINGO L2p8_m9 cluster_000, M200 =
+    # 5.05e15). BAHAMAS peaks at 604, the other FLAMINGO runs at 1691 (Jet).
+    max_nodes: int = 2650
+    # Total sample count to reach when it is not a multiple of the cluster
+    # count (0 = exactly n_projections per cluster). Then every cluster gets
+    # n_projections and n_samples_target - n_clusters * n_projections of them,
+    # chosen per simulation by projection_seed, get one more; see
+    # n_projections_for(), which both slurm stages call.
+    n_samples_target: int = 0
+    projection_seed: int = 20261012
 
     # --- 'galaxy' selection -------------------------------------------------
     # BAHAMAS has no photometry, so the g-band cut is applied through a
     # selection function P(M_g <= mag_cut_g | Mstar) calibrated on TNG300,
     # which does have both (see mag_g_proxy_mask in the build script).
-    tng_calibration_sims: Tuple[str, ...] = ("TNG300-2", "TNG300-3")
+    # All three TNG300 resolutions, for every suite (BAHAMAS, FLAMINGO, TNG300).
+    tng_calibration_sims: Tuple[str, ...] = ("TNG300-1", "TNG300-2", "TNG300-3")
     tng_data_root: str = "/home/habjan.e/TNG/Data/TNG_data/"
     mag_cut_g: float = -18.0
     galaxy_cut_seed: int = 42            # fixed => the same members every projection
@@ -313,6 +361,117 @@ CFG_LENS = LensingConfig()
 CFG_COSMO = CosmologyConfig()
 CFG_DATA = DatasetConfig()
 CFG_XRAY = XrayConfig()
+
+
+# ============================================================
+# Simulation suites
+# ============================================================
+
+# FLAMINGO runs with per-particle cutouts under FLAMINGO_DATA_ROOT, excluding
+# NoCooling: a non-radiative run forms no stars and no black holes, so it has
+# no BCG to centre on and no stellar masses to select members with.
+FLAMINGO_SIMULATIONS = (
+    "L1_m9", "fgas+2sigma", "fgas-2sigma", "Jet", "Mstar-1sigma",
+    "Planck", "PlanckNu0p24Fix", "PlanckNu0p24Var", "PlanckNu0p48Fix",
+    "L2p8_m9",
+)
+FLAMINGO_DATA_ROOT = "/projects/mccleary_group/habjan.e/FLAMINGO/"
+
+# (h, Om0) per FLAMINGO run. Om0 from https://flamingo.strw.leidenuniv.nl/
+# simulations.html (Schaye+ 2023 Table 4, Elbers+ 2024 Table 1); h is the
+# value stored in the cutouts, which carries one more digit than the page
+# (0.6732 against 0.673). Om0 includes the massive neutrinos, and the runs are
+# flat, so Omega_Lambda = 1 - Om0 as for BAHAMAS.
+_D3A = (0.681, 0.306)
+FLAMINGO_COSMOLOGY = {
+    "L1_m9": _D3A, "L2p8_m9": _D3A, "fgas+2sigma": _D3A, "fgas-2sigma": _D3A,
+    "Jet": _D3A, "Mstar-1sigma": _D3A, "NoCooling": _D3A,
+    "Planck": (0.6732, 0.316),
+    "PlanckNu0p24Fix": (0.6732, 0.316),
+    "PlanckNu0p24Var": (0.6623, 0.328),
+    "PlanckNu0p48Fix": (0.6732, 0.316),
+}
+
+# TNG300: halos 0-99 of each resolution, from the 5r200 cutouts in
+# <TNG300_DATA_ROOT>/5r200_data-{1,2,3} (read by TNG300/tng300_io.py). All
+# three share the Planck 2015 cosmology of the snapshot headers.
+TNG300_SIMULATIONS = ("TNG300-1", "TNG300-2", "TNG300-3")
+TNG300_DATA_ROOT = "/projects/mccleary_group/habjan.e/TNG/Data/TNG_data/"
+TNG300_COSMOLOGY = {s: (0.6774, 0.3089) for s in TNG300_SIMULATIONS}
+
+import math as _math
+import os as _os
+
+SUITE = _os.environ.get("CLUSTER_SUITE", "BAHAMAS")
+if SUITE == "FLAMINGO":
+    # One projection per cluster: 10 runs x 250 clusters = 2500 samples.
+    CFG_DATA = DatasetConfig(
+        n_projections=1,
+        simulations=FLAMINGO_SIMULATIONS,
+        cluster_index_range=(0, 250),            # cluster_000..cluster_249
+        sim_data_root=FLAMINGO_DATA_ROOT,
+        cluster_file_stem="cluster",
+    )
+    # The cosmology differs between FLAMINGO runs, so there is no suite-wide
+    # h_sim / Om0_sim: everything goes through sim_cosmology(sim). NaN makes
+    # any leftover use of the suite-wide values fail loudly.
+    CFG_COSMO = CosmologyConfig(h_sim=float("nan"), Om0_sim=float("nan"))
+    CFG_XRAY = XrayConfig(
+        photon_dir="/projects/mccleary_group/habjan.e/TNG/Data/xray_list_files/FLAMINGO",
+        photon_work_dir="/scratch/habjan.e/xray_intermediates/photon_work_flamingo",
+        work_dir="/scratch/habjan.e/xray_intermediates/work_flamingo",
+    )
+elif SUITE == "TNG300":
+    # 3 resolutions x 100 halos = 300 clusters, 8 projections each (2400) plus
+    # a 9th for 100 of them -> 2500 samples, the size of the other two files.
+    CFG_DATA = DatasetConfig(
+        n_projections=8,
+        n_samples_target=2500,
+        simulations=TNG300_SIMULATIONS,
+        cluster_index_range=(0, 100),            # halos 0..99
+        sim_data_root=TNG300_DATA_ROOT,
+        cluster_file_stem="halo",
+    )
+    # Same cosmology for all three, but routed through sim_cosmology like
+    # FLAMINGO so the build code is identical; NaN catches any leftover use.
+    CFG_COSMO = CosmologyConfig(h_sim=float("nan"), Om0_sim=float("nan"))
+    CFG_XRAY = XrayConfig(
+        photon_dir="/projects/mccleary_group/habjan.e/TNG/Data/xray_list_files/TNG300",
+        photon_work_dir="/scratch/habjan.e/xray_intermediates/photon_work_tng300",
+        work_dir="/scratch/habjan.e/xray_intermediates/work_tng300",
+    )
+elif SUITE != "BAHAMAS":
+    raise ValueError(f"CLUSTER_SUITE={SUITE!r}; expected 'BAHAMAS', 'FLAMINGO' or 'TNG300'")
+
+
+def sim_cosmology(sim):
+    """
+    (h, Om0) of one simulation: per run for FLAMINGO and TNG300, CFG_COSMO's
+    BAHAMAS values otherwise. Used for H(z) in the members' redshift-space
+    placement and for the X-ray maps' angular scale, so both match the
+    simulation.
+    """
+    if sim in FLAMINGO_COSMOLOGY:
+        return FLAMINGO_COSMOLOGY[sim]
+    if sim in TNG300_COSMOLOGY:
+        return TNG300_COSMOLOGY[sim]
+    h, Om0 = float(CFG_COSMO.h_sim), float(CFG_COSMO.Om0_sim)
+    if not (_math.isfinite(h) and _math.isfinite(Om0)):
+        raise KeyError(f"no cosmology for simulation {sim!r} in suite {SUITE}")
+    return h, Om0
+
+
+# BAHAMAS box (cMpc/h). The BAHAMAS npz files carry no box size; the FLAMINGO
+# loader (FLAMINGO/flamingo_io.py) adds one under BOXSIZE_KEY, already in cMpc/h.
+BAHAMAS_BOXSIZE_MPC_OVER_H = 400.0
+BOXSIZE_KEY = "boxsize_mpc_over_h"
+
+
+def cluster_boxsize_mpc_over_h(data):
+    """Periodic box size of a loaded cluster file, in comoving Mpc/h."""
+    if BOXSIZE_KEY in data.files:
+        return float(data[BOXSIZE_KEY])
+    return BAHAMAS_BOXSIZE_MPC_OVER_H
 
 
 # ============================================================
@@ -343,12 +502,78 @@ def sample_z_lens(sim, cluster_idx, proj_index, cfg=CFG_LENS):
     return float(rng.uniform(cfg.z_lens_min, cfg.z_lens_max))
 
 
+_EXTRA_PROJECTIONS = {}
+
+
+def _extra_projection_clusters(cfg):
+    """
+    The (sim, cluster) pairs that get one projection beyond cfg.n_projections,
+    so the suite totals cfg.n_samples_target. The extras are split as evenly
+    as possible across simulations (100 over 3 -> 33/33/34) and drawn within
+    each by a SeedSequence keyed on projection_seed and the simulation name,
+    so the choice is fixed by the config alone.
+    """
+    key = (cfg.n_projections, cfg.n_samples_target, cfg.projection_seed,
+           tuple(cfg.simulations), tuple(cfg.cluster_index_range))
+    if key in _EXTRA_PROJECTIONS:
+        return _EXTRA_PROJECTIONS[key]
+    clusters = list(range(*cfg.cluster_index_range))
+    n_sims = len(cfg.simulations)
+    n_extra = cfg.n_samples_target - cfg.n_projections * n_sims * len(clusters)
+    if not 0 <= n_extra <= n_sims * len(clusters):
+        raise ValueError(
+            f"n_samples_target={cfg.n_samples_target} is not reachable with "
+            f"{cfg.n_projections} or {cfg.n_projections + 1} projections of "
+            f"{n_sims} x {len(clusters)} clusters")
+    per_sim, rem = divmod(n_extra, n_sims)
+    chosen = set()
+    for i, sim in enumerate(cfg.simulations):
+        n = per_sim + (1 if i >= n_sims - rem else 0)     # remainder to the last sims
+        rng = np.random.default_rng(np.random.SeedSequence(
+            [int(cfg.projection_seed), int(zlib.crc32(str(sim).encode("utf-8")))]))
+        for c in rng.choice(clusters, size=n, replace=False):
+            chosen.add((str(sim), int(c)))
+    _EXTRA_PROJECTIONS[key] = chosen
+    return chosen
+
+
+def n_projections_for(sim, cluster_idx, cfg=None):
+    """
+    How many projections (sample_z_lens proj_index 0..n-1) cluster
+    `cluster_idx` of `sim` has. cfg.n_projections for every cluster unless
+    cfg.n_samples_target asks for more; then a fixed subset gets one extra
+    (_extra_projection_clusters). The photon stage and the dataset build both
+    call this, so they agree on the sample list without sharing any state.
+    """
+    cfg = CFG_DATA if cfg is None else cfg
+    if not cfg.n_samples_target:
+        return int(cfg.n_projections)
+    extra = (str(sim), int(cluster_idx)) in _extra_projection_clusters(cfg)
+    return int(cfg.n_projections) + int(extra)
+
+
 # Smoke-test override: set SHAPE_DYN_SMOKE_TEST=1 to shrink the dataset to a
 # handful of samples. Production defaults above are unchanged when unset.
-import os as _os
 if _os.environ.get("SHAPE_DYN_SMOKE_TEST", "0") == "1":
-    CFG_DATA = DatasetConfig(
-        n_projections=4,
-        simulations=("CDMb",),
-        cluster_index_range=(1, 4),              # 3 clusters -> 12 samples
-    )
+    if SUITE == "FLAMINGO":
+        import dataclasses as _dc
+        CFG_DATA = _dc.replace(
+            CFG_DATA,
+            simulations=("L1_m9",),
+            cluster_index_range=(0, 3),          # the 3 most massive -> 3 samples
+        )
+    elif SUITE == "TNG300":
+        import dataclasses as _dc
+        CFG_DATA = _dc.replace(
+            CFG_DATA,
+            simulations=("TNG300-1",),
+            cluster_index_range=(0, 1),          # halo 0, the most massive
+            n_projections=1,
+            n_samples_target=0,                  # -> 1 sample
+        )
+    else:
+        CFG_DATA = DatasetConfig(
+            n_projections=4,
+            simulations=("CDMb",),
+            cluster_index_range=(1, 4),          # 3 clusters -> 12 samples
+        )
