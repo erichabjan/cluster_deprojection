@@ -8,10 +8,18 @@ per-simulation-suite files, once the other suites have been run through the same
 analysis.
 
 Per (cluster, sim, projection) sample, all in ONE viewing frame (a single
-projection vector rotates both the cluster members and the matter particles):
-  - dynamics conditioning images (3, H, W): gal_xy, gal_z_xy, gal_z_disp_xy
-  - cluster-member point cloud, padded to max_nodes (features/targets/pixel coords/mask)
-  - 3D density target cube (log-standardized with this file's stats) + global targets
+projection vector rotates both the cluster members and the matter particles),
+with every resolution-dependent product stored once per N in
+CFG_GRID.resolutions under an _N suffix (a model trains on one N):
+  - dynamics conditioning images images_N (3, N, N): gal_xy, gal_z_xy, gal_z_disp_xy
+  - cluster-member point cloud, padded to max_nodes (features/targets/mask), with
+    gal_pixel_coords_N on the N x N image grid
+  - 3D density target cubes density_cube_N (N, N, N), log-standardized with this
+    file's per-N stats, + global targets (from the finest cube, shared by all N).
+    The density is adaptive SPH (density_utils.py): a cubic-spline kernel per
+    particle with h_j the distance to its CFG_DENS.n_ngb-th neighbour, deposited
+    once at the largest N and block-averaged down, so every N is the same field
+    integrated over a different voxel size.
   - NEW: weak-lensing source-galaxy point cloud replacing the projected mass image.
     A lens redshift z_l ~ U[z_lens_min, z_lens_max] is drawn per sample; the rotated
     matter particles give Sigma -> kappa_inf -> gamma (KS93) on a
@@ -109,8 +117,9 @@ import TNG_DA  # rotate_to_viewing_frame
 # live one level up, in dataset/.
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import (CFG_GRID, CFG_SCALE, CFG_LENS, CFG_COSMO, CFG_DATA,
-                    CFG_XRAY, sample_z_lens)
+                    CFG_XRAY, CFG_DENS, sph_h_floor_mpc, sample_z_lens)
 import lensing_utils as lu
+import density_utils as du
 
 # ------------------------------------------------------------
 # Output files
@@ -123,6 +132,11 @@ OUT_FILENAME = "bahamas_dataset.hdf5"
 BOXSIZE_MPC_OVER_H = 400.0   # BAHAMAS box (cMpc/h)
 EPS = 1e-9
 C_KMS = 299792.458           # speed of light, km/s
+
+# Threads per worker for the SPH kNN and deposit; the pool gets
+# SLURM_CPUS_PER_TASK // SPH_THREADS workers. 1 unless memory, not CPUs, caps
+# the worker count (TNG300-1: ~10^8 particles per cluster).
+SPH_THREADS = int(os.environ.get("SPH_THREADS", "1"))
 
 # Gaussian width whose |e| < 1 truncation realizes CFG_LENS.sigma_e_realized.
 SIGMA_E_INPUT = lu.gaussian_sigma_for_truncated(CFG_LENS.sigma_e_realized)
@@ -381,16 +395,6 @@ def members_to_redshift(z_los_mpc, v_los_kms, z_bcg):
 # Dynamics helpers (from conditional_diffusion_data.py)
 # ============================================================
 
-def _bin3d_sum(x, y, z, w, lim, N):
-    H, _ = np.histogramdd(
-        np.stack([z, y, x], axis=-1).astype(np.float64),
-        bins=(N, N, N),
-        range=(lim, lim, lim),
-        weights=w.astype(np.float64),
-    )
-    return H.astype(np.float32)
-
-
 def make_galaxy_map_xy(x, y, fov, N_img):
     n = max(len(x), 1)
     w = np.full_like(x, 1.0 / n, dtype=np.float32)
@@ -435,19 +439,23 @@ def build_sigma_2d(components, fov, N):
     return sigma / (pix_area + 1e-30)
 
 
-def build_density_cube(components, fov, N):
-    cube = np.zeros((N, N, N), dtype=np.float32)
-    for pos, m in components.values():
-        if pos.shape[0] == 0:
-            continue
-        keep = ((pos[:, 0] >= -fov) & (pos[:, 0] <= fov)
-                & (pos[:, 1] >= -fov) & (pos[:, 1] <= fov)
-                & (pos[:, 2] >= -fov) & (pos[:, 2] <= fov))
-        if keep.any():
-            cube += _bin3d_sum(pos[keep, 0], pos[keep, 1], pos[keep, 2],
-                               m[keep], (-fov, fov), N)
-    voxel = (2.0 * fov / N) ** 3
-    return cube / (voxel + 1e-30)
+def build_density_cube(components, fov, cache_path, h_floor_mpc):
+    """
+    Adaptive-SPH density on the finest grid, max(CFG_GRID.resolutions)^3 over
+    [-fov, fov]^3 (Msun/Mpc^3, zyx), plus the mass falling outside it.
+
+    Every particle of the cutout enters, inside the cube or not, so kernels
+    near the faces see their full neighbourhood. h_j comes from the
+    per-cluster cache: it is a function of inter-particle distances alone,
+    which the projection's rotation does not change.
+    """
+    pos = np.concatenate([p for p, _ in components.values()], axis=0)
+    mass = np.concatenate([m for _, m in components.values()], axis=0)
+    h = du.cached_smoothing_lengths(cache_path, pos, CFG_DENS.n_ngb, h_floor_mpc,
+                                    workers=SPH_THREADS)
+    rho, outside = du.sph_density_cube(pos, mass, h, fov, max(CFG_GRID.resolutions),
+                                       sub=CFG_DENS.sub, n_threads=SPH_THREADS)
+    return rho.astype(np.float32), outside
 
 
 def log_standardize_with_floor(x, mean, std, floor_value, eps=0.0):
@@ -462,9 +470,15 @@ def log_standardize_with_floor(x, mean, std, floor_value, eps=0.0):
 
 
 def xy_to_pixel_coords(x, y, fov, N_img):
-    x01 = np.clip((x + fov) / (2.0 * fov + CFG_GRID.eps), 0.0, 1.0)
-    y01 = np.clip((y + fov) / (2.0 * fov + CFG_GRID.eps), 0.0, 1.0)
-    return np.stack([x01 * (N_img - 1), y01 * (N_img - 1)], axis=-1).astype(np.float32)
+    """
+    Continuous pixel coordinates on the N_img x N_img image grid, pixel-centre
+    convention: pixel i spans [i - 0.5, i + 0.5), so floor(coord + 0.5) is the
+    bin lu.bin2d_sum put the galaxy in. (The old x01 * (N_img - 1) drifted up
+    to half a pixel from that binning.)
+    """
+    x01 = np.clip((x + fov) / (2.0 * fov), 0.0, 1.0)
+    y01 = np.clip((y + fov) / (2.0 * fov), 0.0, 1.0)
+    return np.stack([x01 * N_img - 0.5, y01 * N_img - 0.5], axis=-1).astype(np.float32)
 
 
 def rho_cube_to_mass_msun(rho_cube, fov_mpc):
@@ -856,7 +870,7 @@ def build_xray_maps(sim, cluster_idx, proj_index, proj_vec, z_lens, h_sim,
     work_prefix = f"s_{sim}_{cluster_idx:03d}_{seed}"
     try:
         products = xu.project_and_observe(photon_prefix, work_prefix, proj_vec,
-                                          t_exp_ks)
+                                          t_exp_ks, seed=seed)
         # The photon list is at this sample's own z_lens, so the angular scale
         # the maps are stored with is the same one the lensing geometry uses.
         maps = xu.build_sample_maps(products, z_lens, h_sim)
@@ -1015,21 +1029,32 @@ def build_one_sample(args) -> Dict:
     }
 
     # -------------------------------
-    # Dynamics conditioning images (mass_xy replaced by the source catalog)
+    # Dynamics conditioning images (mass_xy replaced by the source catalog),
+    # one (3, N, N) stack per resolution
     # -------------------------------
-    N_img = CFG_GRID.image_resolution
-    gal_xy = make_galaxy_map_xy(x, y, fov, N_img)
-    # Mean channel: per-pixel mean of the standardized member redshift (empty
-    # pixels stay at 0). Dispersion channel: per-pixel redshift dispersion on
-    # its own scale, which is ~z_std/8 and would otherwise be a flat image.
-    gal_z_xy = make_galaxy_los_mean_xy(x, y, z_gal_s, fov, N_img)
-    gal_z_disp_xy = (make_galaxy_los_disp_xy(x, y, z_gal.astype(np.float32),
-                                            fov, N_img) / CFG_SCALE.z_disp_std)
+    images = {}
+    for N_img in CFG_GRID.resolutions:
+        gal_xy = make_galaxy_map_xy(x, y, fov, N_img)
+        # Mean channel: per-pixel mean of the standardized member redshift
+        # (empty pixels stay at 0). Dispersion channel: per-pixel redshift
+        # dispersion on its own scale, which is ~z_std/8 and would otherwise be
+        # a flat image.
+        gal_z_xy = make_galaxy_los_mean_xy(x, y, z_gal_s, fov, N_img)
+        gal_z_disp_xy = (make_galaxy_los_disp_xy(x, y, z_gal.astype(np.float32),
+                                                fov, N_img) / CFG_SCALE.z_disp_std)
+        images[N_img] = np.stack([gal_xy, gal_z_xy, gal_z_disp_xy],
+                                 axis=0).astype(np.float32)
 
     # -------------------------------
     # 3D target cube + global targets
     # -------------------------------
-    density_cube = build_density_cube(components, fov, CFG_GRID.cube_resolution)
+    # Only the finest cube is built here; main() block-averages it to the
+    # other resolutions. The global targets are physical quantities, so they
+    # come from this most accurate cube and are shared by every N.
+    h_cache = os.path.join(CFG_DENS.cache_dir, sim,
+                           f"GrNm_{cluster_idx:03d}_ngb{CFG_DENS.n_ngb}.npz")
+    density_cube, mass_outside = build_density_cube(components, fov, h_cache,
+                                                    sph_h_floor_mpc(sim))
     cube_mass_msun = rho_cube_to_mass_msun(density_cube, fov)
     cube_mass_log10_msun = np.log10(max(cube_mass_msun, 1e-30))
     axis_lengths_mpc = np.array(rho_cube_to_axis_lengths_mpc(density_cube, fov),
@@ -1038,8 +1063,6 @@ def build_one_sample(args) -> Dict:
     # -------------------------------
     # Cluster-member point cloud (padded)
     # -------------------------------
-    gal_pixel_coords = xy_to_pixel_coords(x, y, fov, N_img)
-
     x_s = (x - CFG_SCALE.pos_mean) / CFG_SCALE.pos_std
     y_s = (y - CFG_SCALE.pos_mean) / CFG_SCALE.pos_std
     z_sc = (z - CFG_SCALE.pos_mean) / CFG_SCALE.pos_std
@@ -1055,12 +1078,14 @@ def build_one_sample(args) -> Dict:
     n_keep = min(N_gal, max_nodes)
     feat_pad = np.zeros((max_nodes, 4), dtype=np.float32)
     targ_pad = np.zeros((max_nodes, 3), dtype=np.float32)
-    pix_pad = np.zeros((max_nodes, 2), dtype=np.float32)
     mask = np.zeros((max_nodes,), dtype=np.float32)
     feat_pad[:n_keep] = gal_features[:n_keep]
     targ_pad[:n_keep] = gal_targets[:n_keep]
-    pix_pad[:n_keep] = gal_pixel_coords[:n_keep]
     mask[:n_keep] = 1.0
+    pix_pad = {}
+    for N_img in CFG_GRID.resolutions:
+        pix_pad[N_img] = np.zeros((max_nodes, 2), dtype=np.float32)
+        pix_pad[N_img][:n_keep] = xy_to_pixel_coords(x, y, fov, N_img)[:n_keep]
 
     # -------------------------------
     # Weak-lensing source-galaxy point cloud
@@ -1159,13 +1184,11 @@ def build_one_sample(args) -> Dict:
         # rather than to float32's ~7 digits.
         z_lens=np.float64(z_lens),
 
-        gal_xy=gal_xy.astype(np.float32),
-        gal_z_xy=gal_z_xy.astype(np.float32),
-        gal_z_disp_xy=gal_z_disp_xy.astype(np.float32),
+        images=images,                     # {N: (3, N, N)}
 
         gal_features=feat_pad,
         gal_targets=targ_pad,
-        gal_pixel_coords=pix_pad,
+        gal_pixel_coords=pix_pad,          # {N: (max_nodes, 2)}
         mask=mask,
         n_gal=np.int32(N_gal),
 
@@ -1180,7 +1203,8 @@ def build_one_sample(args) -> Dict:
         src_true_foreground_frac=np.float32(src_true_foreground_frac),
         src_z_true_mean=np.float32(src_z_true_mean),
 
-        raw_density_cube=density_cube,
+        raw_density_cube=density_cube,     # finest resolution only
+        sph_mass_outside_msun=np.float64(mass_outside),
         cube_mass_log10_msun=np.float32(cube_mass_log10_msun),
         axis_lengths_mpc=axis_lengths_mpc,
 
@@ -1190,14 +1214,46 @@ def build_one_sample(args) -> Dict:
     )
 
 
+def build_cluster_samples(cluster_jobs):
+    """
+    Every projection of one (sim, cluster), on one worker. Grouped so the
+    first projection writes the cluster's h_j cache and the rest read it back,
+    instead of all projections running the kNN at once on different workers.
+    """
+    return [build_one_sample(job) for job in cluster_jobs]
+
+
+class _LogStats:
+    """Running count / sum / sum of squares of log10(cube) over positive voxels."""
+
+    def __init__(self):
+        self.n, self.s, self.s2 = 0, 0.0, 0.0
+
+    def add(self, cube):
+        v = cube[cube > 0.0]
+        if v.size:
+            lv = np.log10(v.astype(np.float64))
+            self.n += lv.size
+            self.s += float(np.sum(lv))
+            self.s2 += float(np.sum(lv * lv))
+
+    def mean_std(self):
+        if self.n == 0:
+            raise RuntimeError("no positive-valued cube voxels found")
+        mean = self.s / self.n
+        return mean, float(np.sqrt(max(self.s2 / self.n - mean * mean, 0.0)) + 1e-6)
+
+
 # ============================================================
 # Writing
 # ============================================================
 
 def write_static_attrs(f: h5py.File):
     f.attrs["map_fov_mpc"] = CFG_GRID.fov_mpc
-    f.attrs["image_resolution"] = CFG_GRID.image_resolution
-    f.attrs["cube_resolution"] = CFG_GRID.cube_resolution
+    # Every resolution-dependent product is stored once per N here, suffixed
+    # _N: images_N (3,N,N), gal_pixel_coords_N, density_cube_N (N,N,N), and the
+    # file attrs cube_log10_{mean,std}_N.
+    f.attrs["resolutions"] = np.array(CFG_GRID.resolutions, dtype=np.int64)
     f.attrs["vz_max_kms"] = CFG_GRID.vz_max_kms
     f.attrs["floor_value"] = CFG_GRID.floor_value
     f.attrs["max_nodes"] = CFG_DATA.max_nodes
@@ -1277,9 +1333,26 @@ def write_static_attrs(f: h5py.File):
     f.attrs["image_channels"] = np.array(
         [b"gal_xy", b"gal_z_xy", b"gal_z_disp_xy"], dtype="S20")
     f.attrs["density_cube_order"] = "zyx"
+    f.attrs["density_estimator"] = (
+        f"adaptive SPH: rho(x) = sum_j m_j W(|x - x_j|, h_j), Gadget cubic "
+        f"spline, h_j = distance to the {CFG_DENS.n_ngb}th nearest neighbour "
+        f"over all species of the cutout, floored at density_h_floor_mpc (per simulation). Each "
+        f"voxel holds the voxel-averaged density (Msun/Mpc^3, before "
+        f"standardization), with mass conserved per particle. Deposited once at "
+        f"{max(CFG_GRID.resolutions)}^3; the coarser density_cube_N are exact "
+        f"block averages of it, i.e. the same field over larger voxels.")
+    f.attrs["density_n_ngb"] = CFG_DENS.n_ngb
+    f.attrs["density_h_floor_mpc"] = ";".join(
+        f"{s}:{sph_h_floor_mpc(s):.5f}" for s in CFG_DATA.simulations)
+    f.attrs["density_sub_samples"] = CFG_DENS.sub
+    f.attrs["globals_target_resolution"] = max(CFG_GRID.resolutions)
     f.attrs["gal_feature_columns"] = np.array([b"x", b"y", b"z_gal", b"Ngal"], dtype="S8")
     f.attrs["gal_target_columns"] = np.array([b"z", b"vx", b"vy"], dtype="S8")
     f.attrs["gal_pixel_coords_columns"] = np.array([b"x_pix", b"y_pix"], dtype="S8")
+    f.attrs["gal_pixel_coords_convention"] = (
+        "continuous coordinates on the N x N grid of images_N, pixel-centre "
+        "convention: pixel i spans [i - 0.5, i + 0.5), so floor(coord + 0.5) "
+        "is the image bin the galaxy was counted in")
     f.attrs["globals_target_columns"] = np.array(
         [b"mass_log10_msun", b"axis_a_mpc", b"axis_b_mpc", b"axis_c_mpc"], dtype="S20")
 
@@ -1380,16 +1453,16 @@ def write_sample_streaming(f: h5py.File, sample_id: int, sample: Dict):
     grp.attrs["n_sources"] = int(sample["n_src"])
     grp.attrs["z_lens"] = float(sample["z_lens"])
 
-    images = np.stack(
-        [sample["gal_xy"], sample["gal_z_xy"], sample["gal_z_disp_xy"]],
-        axis=0,
-    ).astype(np.float32)
+    grp.attrs["sph_mass_outside_msun"] = float(sample["sph_mass_outside_msun"])
 
     grp.create_dataset("projection_vector", data=sample["proj_vec"])
-    grp.create_dataset("images", data=images, compression="gzip")               # (3,H,W)
+    for N in CFG_GRID.resolutions:
+        grp.create_dataset(f"images_{N}", data=sample["images"][N],
+                           compression="gzip")                                 # (3,N,N)
+        grp.create_dataset(f"gal_pixel_coords_{N}", data=sample["gal_pixel_coords"][N],
+                           compression="gzip")
     grp.create_dataset("gal_features", data=sample["gal_features"], compression="gzip")
     grp.create_dataset("gal_targets", data=sample["gal_targets"], compression="gzip")
-    grp.create_dataset("gal_pixel_coords", data=sample["gal_pixel_coords"], compression="gzip")
     grp.create_dataset("mask", data=sample["mask"], compression="gzip")
 
     grp.create_dataset("src_features", data=sample["src_features"], compression="gzip")
@@ -1438,19 +1511,26 @@ def write_sample_streaming(f: h5py.File, sample_id: int, sample: Dict):
         grp.attrs["xray_t_exp_ks"] = float(xray["xray_t_exp_ks"])
 
 
-def write_sample_targets(f: h5py.File, sample_id: int, cube, mass_log10, axes,
-                         cube_mean, cube_std, mass_mean, mass_std, axis_mean, axis_std):
-    """Second pass: standardized cube + global targets into the existing group."""
+def write_sample_targets(f: h5py.File, sample_id: int, cubes, mass_log10, axes,
+                         cube_stats, mass_mean, mass_std, axis_mean, axis_std):
+    """
+    Second pass: standardized cubes + global targets into the existing group.
+    cubes and cube_stats are keyed on resolution: {N: raw (N,N,N)} and
+    {N: (log10 mean, log10 std)}.
+    """
     grp = f[f"{sample_id:06d}"]
-    cube_norm = log_standardize_with_floor(
-        cube, cube_mean, cube_std, floor_value=CFG_GRID.floor_value)
+    for N, cube in cubes.items():
+        cube_mean, cube_std = cube_stats[N]
+        cube_norm = log_standardize_with_floor(
+            cube, cube_mean, cube_std, floor_value=CFG_GRID.floor_value)
+        grp.create_dataset(f"density_cube_{N}", data=cube_norm,
+                           compression="gzip")                                 # (Z,Y,X)
 
     std_mass = (float(mass_log10) - mass_mean) / mass_std
     std_axes = (axes.astype(np.float64) - axis_mean) / axis_std
     globals_target = np.concatenate(
         [np.array([std_mass], dtype=np.float32), std_axes.astype(np.float32)], axis=0)
 
-    grp.create_dataset("density_cube", data=cube_norm, compression="gzip")      # (Z,Y,X)
     grp.create_dataset("cube_mass_log10_msun", data=np.float32(mass_log10))
     grp.create_dataset("axis_lengths_mpc", data=axes.astype(np.float32))
     grp.create_dataset("globals_target", data=globals_target)
@@ -1515,6 +1595,15 @@ def main():
     print(f"clusters={len(cluster_inds)}, sims={len(sims)}, proj/cluster={n_proj}, "
           f"total samples={n_clusters_total * n_proj}")
 
+    resolutions = tuple(int(N) for N in CFG_GRID.resolutions)
+    N_fine = max(resolutions)
+    if any(N_fine % N for N in resolutions):
+        raise ValueError(f"every resolution in {resolutions} must divide {N_fine}")
+    print(f"resolutions {resolutions}: SPH (n_ngb={CFG_DENS.n_ngb}, h floor "
+          f"{', '.join(f'{1e3 * sph_h_floor_mpc(s):.1f}' for s in sims)} kpc) "
+          f"deposited at {N_fine}^3 and "
+          f"block-averaged down; h_j cached under {CFG_DENS.cache_dir}")
+
     rng = np.random.default_rng(CFG_DATA.rng_seed)
 
     jobs = []
@@ -1533,36 +1622,56 @@ def main():
 
     check_photon_lists(jobs)
 
-    n_workers = int(os.environ.get("SLURM_CPUS_PER_TASK", "1"))
-    print(f"using {n_workers} workers; streaming samples to h5...")
+    # One task per (sim, cluster), so its projections share one h_j cache; see
+    # build_cluster_samples. The jobs themselves are unchanged.
+    tasks = {}
+    for job in jobs:
+        tasks.setdefault((job[1], job[2]), []).append(job)
+    tasks = list(tasks.values())
 
-    # Big ragged arrays are written the moment they arrive; only the small
-    # cubes + global targets are held back until the dataset stats exist.
-    held_targets = {}                 # sid -> (cube, mass_log10, axes)
+    n_cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", "1"))
+    n_workers = max(1, n_cpus // SPH_THREADS)
+    print(f"using {n_workers} workers x {SPH_THREADS} SPH threads on {len(tasks)} "
+          f"clusters; streaming samples to h5...")
+
+    # Big ragged arrays are written the moment they arrive. The raw finest
+    # cubes (8 MB each at 128^3, ~20 GB over the suite) go to a side file on
+    # scratch rather than memory until the per-N stats exist; only the small
+    # global targets are held.
+    raw_path = os.path.join(CFG_DENS.cache_dir,
+                            OUT_FILENAME.replace(".hdf5", "_raw_cubes.h5"))
+    os.makedirs(CFG_DENS.cache_dir, exist_ok=True)
+    held_targets = {}                 # sid -> (mass_log10, axes)
+    cube_log_stats = {N: _LogStats() for N in resolutions}
     n_src_seen = []
     n_gal_seen = []
 
-    with h5py.File(out_path, "w") as f_out:
+    with h5py.File(out_path, "w") as f_out, h5py.File(raw_path, "w") as f_raw:
         write_static_attrs(f_out)
 
+        sid = 0
         with mp.get_context("spawn").Pool(
             processes=n_workers,
             initializer=_init_worker,
             initargs=(z_template, mag_calibration),
         ) as pool:
-            for sid, sample in enumerate(
-                    pool.imap_unordered(build_one_sample, jobs, chunksize=1)):
-                write_sample_streaming(f_out, sid, sample)
-                held_targets[sid] = (
-                    sample["raw_density_cube"],
-                    float(sample["cube_mass_log10_msun"]),
-                    np.asarray(sample["axis_lengths_mpc"]),
-                )
-                n_src_seen.append(int(sample["n_src"]))
-                n_gal_seen.append(int(sample["n_gal"]))
+            for samples in pool.imap_unordered(build_cluster_samples, tasks, chunksize=1):
+                for sample in samples:
+                    write_sample_streaming(f_out, sid, sample)
+                    rho = sample["raw_density_cube"]
+                    f_raw.create_dataset(f"{sid:06d}", data=rho)
+                    for N, cube in du.multires_cubes(rho, resolutions).items():
+                        cube_log_stats[N].add(cube)
+                    held_targets[sid] = (
+                        float(sample["cube_mass_log10_msun"]),
+                        np.asarray(sample["axis_lengths_mpc"]),
+                    )
+                    n_src_seen.append(int(sample["n_src"]))
+                    n_gal_seen.append(int(sample["n_gal"]))
+                    sid += 1
 
-                if (sid + 1) % 250 == 0:
-                    print(f"  built/wrote {sid + 1}/{len(jobs)}", flush=True)
+                    if sid % 250 == 0:
+                        print(f"  built/wrote {sid}/{len(jobs)}", flush=True)
 
         n_src_seen = np.asarray(n_src_seen)
         print(f"source counts: min={n_src_seen.min()}, "
@@ -1583,33 +1692,29 @@ def main():
         if not held_targets:
             raise RuntimeError("no samples were built")
 
-        cube_logs = []
-        for cube, _, _ in held_targets.values():
-            cmask = cube > 0.0
-            if np.any(cmask):
-                cube_logs.append(np.log10(cube[cmask].astype(np.float64)))
-        if not cube_logs:
-            raise RuntimeError("no positive-valued cube voxels found")
-        cube_logs = np.concatenate(cube_logs)
-        cube_mean = float(np.mean(cube_logs))
-        cube_std = float(np.std(cube_logs) + 1e-6)
+        # Per resolution: a 128^3 cube resolves a denser core than a 16^3 one,
+        # so the log10 distributions differ.
+        cube_stats = {N: cube_log_stats[N].mean_std() for N in resolutions}
 
-        mass_logs = np.array([m for _, m, _ in held_targets.values()], dtype=np.float64)
-        axes_all = np.stack([a for _, _, a in held_targets.values()], axis=0).astype(np.float64)
+        mass_logs = np.array([m for m, _ in held_targets.values()], dtype=np.float64)
+        axes_all = np.stack([a for _, a in held_targets.values()], axis=0).astype(np.float64)
         mass_mean = float(np.mean(mass_logs))
         mass_std = float(np.std(mass_logs) + 1e-6)
         axis_mean = np.mean(axes_all, axis=0)
         axis_std = np.std(axes_all, axis=0) + 1e-6
 
-        print(f"3D density   log10 mean/std: {cube_mean:.6f}, {cube_std:.6f}")
+        for N in resolutions:
+            print(f"3D density {N:3d}^3 log10 mean/std: "
+                  f"{cube_stats[N][0]:.6f}, {cube_stats[N][1]:.6f}")
         print(f"Cube mass log10(Msun) mean/std: {mass_mean:.6f}, {mass_std:.6f}")
         print(f"Axis lengths Mpc mean (a,b,c) : "
               f"{axis_mean[0]:.6f}, {axis_mean[1]:.6f}, {axis_mean[2]:.6f}")
         print(f"Axis lengths Mpc std  (a,b,c) : "
               f"{axis_std[0]:.6f}, {axis_std[1]:.6f}, {axis_std[2]:.6f}")
 
-        f_out.attrs["cube_log10_mean"] = cube_mean
-        f_out.attrs["cube_log10_std"] = cube_std
+        for N in resolutions:
+            f_out.attrs[f"cube_log10_mean_{N}"] = cube_stats[N][0]
+            f_out.attrs[f"cube_log10_std_{N}"] = cube_stats[N][1]
         f_out.attrs["cube_mass_log10_mean"] = mass_mean
         f_out.attrs["cube_mass_log10_std"] = mass_std
         f_out.attrs["axis_mean"] = axis_mean
@@ -1620,11 +1725,13 @@ def main():
         # Second pass: standardized cubes + global targets
         # -------------------------------
         print(f"Writing cubes/targets ({len(held_targets)} samples)...")
-        for sid, (cube, mass_log10, axes) in held_targets.items():
-            write_sample_targets(f_out, sid, cube, mass_log10, axes,
-                                 cube_mean, cube_std, mass_mean, mass_std,
+        for sid, (mass_log10, axes) in held_targets.items():
+            cubes = du.multires_cubes(f_raw[f"{sid:06d}"][()], resolutions)
+            write_sample_targets(f_out, sid, cubes, mass_log10, axes,
+                                 cube_stats, mass_mean, mass_std,
                                  axis_mean, axis_std)
 
+    os.remove(raw_path)
     print("Done.")
     print(f"{out_path} ({len(held_targets)} samples)")
 

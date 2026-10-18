@@ -11,7 +11,7 @@ pipeline actually uses.
 
 Simulation suites: the CFG_* objects below default to BAHAMAS. Setting the
 environment variable CLUSTER_SUITE=FLAMINGO *before* this module is first
-imported swaps CFG_DATA, CFG_COSMO and CFG_XRAY for their FLAMINGO versions
+imported swaps CFG_DATA, CFG_COSMO, CFG_XRAY and CFG_DENS for their FLAMINGO versions
 (see the bottom of the file); dataset/FLAMINGO/*.py set it themselves. Every
 other setting -- grids, scalings, lensing, the X-ray source model and
 observation -- is shared, so the two suites are built identically.
@@ -42,8 +42,11 @@ EMPIRICAL_REDSHIFT_TEMPLATES = {
 @dataclass
 class GridConfig:
     fov_mpc: float = 5.0                 # half-extent: everything spans [-fov_mpc, +fov_mpc]
-    image_resolution: int = 16           # dynamics conditioning images (gal_xy, vz, vz_disp)
-    cube_resolution: int = 16            # 3D density target cube
+    # Every resolution the dataset is built at. Each N gets its own N^3 density
+    # cube and its own N x N dynamics products (images_N, gal_pixel_coords_N);
+    # a model is trained on one N. The SPH field is deposited once at the
+    # largest N and block-averaged down, so each N must divide the largest.
+    resolutions: Tuple[int, ...] = (16, 32, 64, 128)
     vz_max_kms: float = 4000.0
     eps: float = 1e-12
     floor_value: float = -5.0            # value for empty / ultra-low voxels after normalization
@@ -314,6 +317,23 @@ class XrayConfig:
 
 
 @dataclass
+class DensityConfig:
+    """
+    Adaptive-SPH density cubes (density_utils.py), chosen against NGP, fixed
+    Gaussian, DTFE and 32/128-neighbour SPH in
+    /scratch/habjan.e/density_smoothing_tests.
+    """
+    n_ngb: int = 64                      # h_j = distance to the n_ngb-th neighbour, all species
+    # h_j is floored at 2.8 times the simulation's Plummer-equivalent softening
+    # (Gadget's spline support), from SOFTENING_KPC via sph_h_floor_mpc(sim).
+    sub: float = 6.0                     # sub-samples across a kernel's support
+    # Per-cluster h_j caches (projection-independent), on scratch since they
+    # regenerate: <cache_dir>/<sim>/<stem>_<idx>_ngb<n_ngb>.npz. The build's
+    # raw-cube side file goes here too.
+    cache_dir: str = "/scratch/habjan.e/cube_intermediates/BAHAMAS"
+
+
+@dataclass
 class DatasetConfig:
     # 5 simulations x 100 clusters x n_projections. The build writes a single
     # bahamas_dataset.hdf5; the train/val/test split happens later, across the
@@ -361,6 +381,7 @@ CFG_LENS = LensingConfig()
 CFG_COSMO = CosmologyConfig()
 CFG_DATA = DatasetConfig()
 CFG_XRAY = XrayConfig()
+CFG_DENS = DensityConfig()
 
 
 # ============================================================
@@ -399,6 +420,23 @@ TNG300_SIMULATIONS = ("TNG300-1", "TNG300-2", "TNG300-3")
 TNG300_DATA_ROOT = "/projects/mccleary_group/habjan.e/TNG/Data/TNG_data/"
 TNG300_COSMOLOGY = {s: (0.6774, 0.3089) for s in TNG300_SIMULATIONS}
 
+# Physical Plummer-equivalent gravitational softening at z = 0, kpc, of the
+# dark matter and stars: the floor of the SPH smoothing lengths
+# (sph_h_floor_mpc). BAHAMAS 4 kpc/h (Robertson+ 2019); FLAMINGO m9 2.85 kpc
+# (Schaye+ 2023); TNG300 1/2/4 ckpc/h at h = 0.6774 (Pillepich+ 2018,
+# Nelson+ 2019).
+BAHAMAS_SOFTENING_KPC = 5.7
+SOFTENING_KPC = {
+    **{s: 2.85 for s in FLAMINGO_SIMULATIONS},
+    "TNG300-1": 1.48, "TNG300-2": 2.95, "TNG300-3": 5.90,
+}
+
+
+def sph_h_floor_mpc(sim):
+    """Floor of the SPH smoothing lengths for `sim`: 2.8 x softening, in Mpc."""
+    return 2.8 * SOFTENING_KPC.get(sim, BAHAMAS_SOFTENING_KPC) / 1e3
+
+
 import math as _math
 import os as _os
 
@@ -421,6 +459,7 @@ if SUITE == "FLAMINGO":
         photon_work_dir="/scratch/habjan.e/xray_intermediates/photon_work_flamingo",
         work_dir="/scratch/habjan.e/xray_intermediates/work_flamingo",
     )
+    CFG_DENS = DensityConfig(cache_dir="/scratch/habjan.e/cube_intermediates/FLAMINGO")
 elif SUITE == "TNG300":
     # 3 resolutions x 100 halos = 300 clusters, 8 projections each (2400) plus
     # a 9th for 100 of them -> 2500 samples, the size of the other two files.
@@ -440,6 +479,7 @@ elif SUITE == "TNG300":
         photon_work_dir="/scratch/habjan.e/xray_intermediates/photon_work_tng300",
         work_dir="/scratch/habjan.e/xray_intermediates/work_tng300",
     )
+    CFG_DENS = DensityConfig(cache_dir="/scratch/habjan.e/cube_intermediates/TNG300")
 elif SUITE != "BAHAMAS":
     raise ValueError(f"CLUSTER_SUITE={SUITE!r}; expected 'BAHAMAS', 'FLAMINGO' or 'TNG300'")
 

@@ -14,6 +14,12 @@
 # BAHAMAS build, at a similar ~1 min per sample for the single ACIS-I pointing,
 # so a few hours on 16 workers. Resources mirror build_bahamas_dataset.slurm.
 #
+# The adaptive-SPH density cube adds a ~1 min 128^3 deposit per sample and a
+# kNN per cluster (cached under /scratch/habjan.e/cube_intermediates/FLAMINGO;
+# one projection per cluster, so the cache only pays off on re-runs). The m9
+# runs have BAHAMAS-like particle counts: L1_m9 cluster 100 took 1:50 for the
+# whole sample at 1.5 GB. ~80-100 core-h, ~6 h on 16 workers.
+#
 # Set CFG_XRAY.enabled = False for a dynamics/lensing-only build, which runs in
 # minutes and needs none of the photon lists.
 
@@ -21,6 +27,8 @@ export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
+export SPH_THREADS=1
+export NUMBA_NUM_THREADS=1
 
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate cl_dyn

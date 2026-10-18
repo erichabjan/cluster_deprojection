@@ -2,8 +2,8 @@
 #SBATCH --job-name=tng300_dataset
 #SBATCH --output=/home/habjan.e/TNG/Sandbox_notebooks/phase_space_recon/shape_dynamics_slurm_logs/build_tng300_dataset_%j.log
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
-#SBATCH --time=1-06:00:00
+#SBATCH --cpus-per-task=16
+#SBATCH --time=2-00:00:00
 #SBATCH --mem=210G
 #SBATCH --partition=short
 
@@ -26,9 +26,24 @@
 #                      halo 0), ~1.5 min TNG300-2, ~1 min TNG300-3
 #   total              833 x (3 + 1.5 + 1) min = ~76 core-h / 4 workers = ~19 h
 #                      -> x 1.5 = ~30 h (--time)
+# Adaptive-SPH density cubes (measured, one thread): per cluster a kNN of
+# ~21 s per 1e6 particles (cached under /scratch/habjan.e/cube_intermediates/
+# TNG300, shared by the cluster's 8-9 projections), and per sample a 128^3
+# deposit of ~22 s per 1e6 particles. TNG300-1 halo 50 (19.3M particles):
+# kNN 413 s, deposit 422 s, 3.8 GB; TNG300-2 halo 50 (2.2M): 36 s / 68 s;
+# TNG300-3 halo 50 (0.3M): 3 s / 12 s. TNG300-1 halo 0 (139M) extrapolates to
+# ~50 min per deposit and ~10 GB on top of the load. Over the suite that is
+# ~200 core-h, nearly all TNG300-1.
+#
+# Memory, not CPUs, caps the pool at 4 workers, so each worker runs the kNN
+# and deposit on SPH_THREADS = 4 threads: 16 CPUs = 4 workers x 4 threads.
+# Estimate: ~200 core-h SPH / 16 + 2500 x ~1 min X-ray / 4 workers = ~25 h
+# -> x 1.5 = ~38 h, inside --time. One task per (sim, halo) now, so at most
+# one worker holds TNG300-1 halo 0 at a time.
+#
 # If the log shows memory well under the limit after the TNG300-1 halo 0
 # samples, a re-run can use more workers (raise --cpus-per-task, keeping
-# --mem >= 52 GB x workers).
+# --mem >= 52 GB x workers, and --cpus-per-task = workers x SPH_THREADS).
 #
 # Set CFG_XRAY.enabled = False for a dynamics/lensing-only build, which runs in
 # minutes and needs none of the photon lists.
@@ -37,6 +52,8 @@ export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
+export SPH_THREADS=4
+export NUMBA_NUM_THREADS=$SPH_THREADS
 
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate cl_dyn

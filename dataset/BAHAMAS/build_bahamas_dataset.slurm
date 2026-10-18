@@ -22,6 +22,13 @@
 # Drop to --cpus-per-task=12 --mem=62G if the queue for a large-memory node
 # is long.
 #
+# The adaptive-SPH density cube adds ~63 s per sample (one single-threaded
+# 128^3 deposit; the coarser cubes are block averages of it) plus a ~12 s kNN
+# once per cluster, cached under /scratch/habjan.e/cube_intermediates/BAHAMAS.
+# That roughly doubles the per-sample cost: ~80 core-hours, ~5-6 h on 16
+# workers. The raw 128^3 cubes (~20 GB) sit in a side file in the same scratch
+# directory until the per-resolution stats are known, and are deleted at the end.
+#
 # Each sample also solves R500c and sums L_X500c from the particles (~2 s,
 # memoised per worker per cluster) so the sample can be checked against
 # LoVoCCS's L_X > 1e44 erg/s selection after the fact.
@@ -33,6 +40,8 @@ export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
+export SPH_THREADS=1
+export NUMBA_NUM_THREADS=1
 
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate cl_dyn

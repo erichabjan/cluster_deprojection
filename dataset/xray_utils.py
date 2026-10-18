@@ -453,20 +453,32 @@ def make_photon_list(prefix, ds, radius_mpc, redshift, cosmo, cfg=CFG_XRAY):
 
 
 def project_and_observe(photon_prefix, work_prefix, proj_vec, t_exp_ks,
-                        cfg=CFG_XRAY):
+                        cfg=CFG_XRAY, seed=None):
     """
     Project the photon list along the sample's viewing direction and observe it
     for t_exp_ks with cfg.n_side^2 ACIS pointings (one, by default, matching the
     archival Chandra coverage a LoVoCCS cluster actually has).
 
+    seed (the sample's seed) makes the maps reproducible: pyXSIM's projection
+    (absorption, position draws) and SOXS's observation (ARF/RMF sampling,
+    dither, backgrounds) each get their own stream spawned from it. Left at
+    None, both fall back to their unseeded global generators and every run
+    differs.
+
     Returns the paths of the products, all under work_prefix.
     """
     u, v, w = viewing_basis(proj_vec)
+
+    prng_project = prng_observe = None
+    if seed is not None:
+        prng_project, prng_observe = (
+            int(s) for s in np.random.SeedSequence(int(seed)).generate_state(2))
 
     event_prefix = f"{work_prefix}_events"
     pyxsim.project_photons(
         photon_prefix, event_prefix, w, cfg.sky_center,
         absorb_model=cfg.absorb_model, nH=cfg.nH_gal, north_vector=v,
+        prng=prng_project,
     )
 
     events = pyxsim.EventList(f"{event_prefix}.h5")
@@ -490,7 +502,7 @@ def project_and_observe(photon_prefix, work_prefix, proj_vec, t_exp_ks,
         pointings, f"{work_prefix}_simput.fits", f"{work_prefix}_mosaic",
         (t_exp_ks, "ks"), cfg.instrument, overwrite=True,
         instr_bkgnd=cfg.instr_bkgnd, foreground=cfg.foreground,
-        ptsrc_bkgnd=cfg.ptsrc_bkgnd,
+        ptsrc_bkgnd=cfg.ptsrc_bkgnd, prng=prng_observe,
     )
     counts_path = f"{work_prefix}_mosaic_img.fits"
     soxs.make_mosaic_image(mosaic_table, counts_path,
