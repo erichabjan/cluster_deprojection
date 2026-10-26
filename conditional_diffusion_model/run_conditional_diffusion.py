@@ -1,39 +1,43 @@
 import os
 import sys
+import argparse
 import pickle
 import numpy as np
 import optax
 
-sys.path.append(os.getcwd())
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(HERE)
 
 from conditional_diffusion_3d_model import ConditionalUNet3D, DiffusionModelConfig
-from train_conditional_diffusion import preload_hdf5_to_memory, train_model
+from train_conditional_diffusion import load_datasets, split_by_cluster, train_model
+
+DATA_DIR = "/projects/mccleary_group/habjan.e/TNG/Data/shape_dynamics/"
+# Pooled for training and validation; TNG300 is held out as the test set.
+DEFAULT_FILES = ("bahamas_dataset.hdf5", "flamingo_dataset.hdf5")
+RESOLUTIONS = (16, 32, 64, 128)
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Train the conditional 3D diffusion model at one cube resolution.")
+    p.add_argument("--resolution", type=int, required=True, choices=RESOLUTIONS,
+                   help="N of the N^3 density cube (and the N x N conditioning images)")
+    p.add_argument("--files", nargs="+", default=list(DEFAULT_FILES),
+                   help=f"dataset files to pool, relative to {DATA_DIR} unless absolute")
+    p.add_argument("--val-frac", type=float, default=0.2,
+                   help="fraction of each suite's clusters held out for validation")
+    p.add_argument("--split-seed", type=int, default=0)
+    return p.parse_args()
 
 
 def main():
-    data_path = "/projects/mccleary_group/habjan.e/TNG/Data/shape_dynamics/"
-    train_file = "shape_dynamics_train.h5"
-    test_file = "shape_dynamics_val.h5"
+    args = parse_args()
+    N = args.resolution
+    files = [f if os.path.isabs(f) else os.path.join(DATA_DIR, f) for f in args.files]
 
-    train_path = os.path.join(data_path, train_file)
-    test_path = os.path.join(data_path, test_file)
+    data = load_datasets(files, resolution=N)
+    train_idx, val_idx = split_by_cluster(data, val_frac=args.val_frac, seed=args.split_seed)
 
-    train_data = preload_hdf5_to_memory(train_path)
-    test_data = preload_hdf5_to_memory(test_path)
-
-    # The X-ray branch is driven entirely by what the loader found, so a file
-    # predating the standardized maps trains without it. Report that rather
-    # than letting it pass silently -- the model's xray_maps argument defaults
-    # to None, so the run would look normal either way.
-    has_xray = "xray_maps" in train_data
-    if has_xray != ("xray_maps" in test_data):
-        raise ValueError(
-            "train and val disagree on X-ray data "
-            f"(train={has_xray}, val={'xray_maps' in test_data}); the batch "
-            "shapes would differ between train_step and eval_step"
-        )
-
-    meta = train_data["metadata"]
+    meta = data["metadata"]
 
     # Length of the per-source-galaxy embedding produced by the shape MLP
     # (the "C" of the latent 128x128x(C+1) shear cube).
@@ -46,29 +50,24 @@ def main():
         out_channels=1,
         galaxy_token_dim=128,
         num_attention_heads=4,
-        coord_image_size=16,
+        # gal_pixel_coords_N are on the N x N image grid.
+        coord_image_size=N,
         src_embed_dim=src_embed_dim,
         src_out_ch=32,
         shape_grid_size=int(meta["shape_grid_size"]),
-        # Mock-Chandra branch. map_fov_mpc is what converts the sample's
-        # angular pixel scale into a conditioning-cell index, so it has to
-        # match the grid the cubes and images were built on.
-        xray_embed_dim=32,
+        # Mock-Chandra branch. map_fov_mpc sets the physical grid the angular
+        # maps are reprojected onto, so it has to match the grid the cubes and
+        # images were built on.
         xray_out_ch=32,
-        xray_grid_size=int(meta.get("xray_grid_size", 128)),
-        xray_sentinel_z=float(meta.get("xray_sentinel_z", -5.0)),
-        map_fov_mpc=float(meta.get("map_fov_mpc", 5.0)),
+        xray_grid_size=int(meta["xray_grid_size"]),
+        xray_reproj_size=128,
+        map_fov_mpc=float(meta["map_fov_mpc"]),
     )
 
-    if has_xray:
-        print(f"X-ray branch ON: {cfg.xray_grid_size}x{cfg.xray_grid_size} maps "
-              f"(mosaic_z, counts_z, xray_mask, density_mask) -> {cfg.xray_out_ch} "
-              f"channels scattered onto the {cfg.coord_image_size}x"
-              f"{cfg.coord_image_size} grid over +/-{cfg.map_fov_mpc} Mpc")
-    else:
-        print(f"X-ray branch OFF: no xray_mask in {train_file}. The maps are "
-              f"only in the standardized builds; this run conditions on "
-              f"dynamics + lensing alone.")
+    print(f"X-ray branch: {cfg.xray_grid_size}x{cfg.xray_grid_size} angular maps "
+          f"(counts_z, xray_mask, expmap) reprojected onto "
+          f"{cfg.xray_reproj_size}x{cfg.xray_reproj_size} over +/-{cfg.map_fov_mpc} "
+          f"Mpc, then strided to {N}x{N}x{cfg.xray_out_ch}")
 
     model = ConditionalUNet3D(cfg=cfg)
 
@@ -76,7 +75,7 @@ def main():
     num_train_steps = 100_000
     eval_every = 250
     log_every = 50
-    num_eval_batches = 50
+    num_eval_batches = 25           # per validation suite
 
     lr = optax.cosine_decay_schedule(
         init_value=1e-4,
@@ -89,31 +88,31 @@ def main():
     beta_start = 1e-4
     beta_end = 2e-2
 
-    suffix = "_shape_dyn_xray_v1" if has_xray else "_shape_dyn_v1"
+    suites = "+".join(meta["suites"])
+    suffix = f"_shape_dyn_xray_{suites.lower().replace('+', '_')}_N{N}"
 
     wandb_notes = (
-        "Conditional 3D diffusion model on the shape_dynamics dataset. "
-        "16^3 cube with 16x16 dynamics images (gal_xy, vz, vz_disp). "
+        f"Conditional 3D diffusion model on the shape_dynamics datasets, "
+        f"{suites} pooled and split 80/20 by (suite, cluster). "
+        f"{N}^3 adaptive-SPH cube (nominal log10 z-score 11/1) with {N}x{N} "
+        f"dynamics images (gal_xy, gal_z_xy, gal_z_disp_xy). "
         "Weak-lensing source-galaxy point cloud replaces the projected mass "
         "map: per-source MLP embedding, mean-pooled per 128x128 cell, "
-        "+log1p(count) channel, stride-2 convs to 16x16, concatenated onto "
+        f"+log1p(count) channel, stride-2 convs to {N}x{N}, concatenated onto "
         "the conditioning images. Galaxy token cross attention unchanged. "
         "Uniform MSE loss (no floor weighting)."
     )
-    if has_xray:
-        wandb_notes += (
-            " Adds the mock-Chandra branch: the 128x128 maps are on a fixed "
-            "*angular* grid (20' ACIS-I), so unlike the shear branch they "
-            "cannot be strided down -- the field is only 0.7-2.6 Mpc across "
-            "depending on z_lens. Instead a per-pixel MLP over (mosaic_z, "
-            "counts_z, xray_mask, density_mask, z_lens, log10 t_exp_ks, "
-            "log10 mpc_per_pix) is mean-pooled into whichever conditioning "
-            "cell the pixel physically lands in, with log1p(n_detected) and "
-            "detected-fraction channels. Cells the field never reaches take a "
-            "learned sentinel embedding from the same MLP rather than zeros. "
-            "At 16x16 the field spans only 1-6 cells, so the branch acts as a "
-            "mass/dynamical-state proxy."
-        )
+    wandb_notes += (
+        " Adds the mock-Chandra branch: the 128x128 maps on a fixed "
+        "*angular* grid (20' ACIS-I, 0.7-2.6 Mpc across) are reprojected "
+        "exactly (area-weighted, separable overlap matrices) onto a "
+        "physical 128x128 grid over +/-fov, then strided down with convs. "
+        "Pixels carry three states: detected (stored counts_z >= -1), "
+        "observed with no detection (counts_z = -2), unobserved = off the "
+        "detector footprint (counts_z = -5, exposure = -1); channels "
+        "counts_z, exposure/104 cm^2, observed, observed fraction, and "
+        "z_lens, log10 t_exp_ks, log10 mpc_per_pix broadcast."
+    )
 
     cfg_dict = dict(
         base_channels=int(cfg.base_channels),
@@ -131,19 +130,33 @@ def main():
         gal_feature_columns="(x, y, z_gal, Ngal)",
         gal_pixel_coord_columns="(x_pix, y_pix)",
         src_feature_columns="(e1, e2, ix, iy, z_s, z_lens, cell_frac)",
-        xray_branch=bool(has_xray),
-        xray_embed_dim=int(cfg.xray_embed_dim),
+        resolution=int(N),
+        data_files=",".join(files),
+        suites=suites,
+        split="by (suite, cluster_index), each suite separately",
+        val_frac=float(args.val_frac),
+        split_seed=int(args.split_seed),
+        n_train=int(len(train_idx)),
+        n_val=int(len(val_idx)),
+        cube_log10_mean=float(meta["cube_log10_mean"]),
+        cube_log10_std=float(meta["cube_log10_std"]),
+        cube_floor_value=float(meta["cube_floor_value"]),
         xray_out_ch=int(cfg.xray_out_ch),
         xray_grid_size=int(cfg.xray_grid_size),
-        xray_sentinel_z=float(cfg.xray_sentinel_z),
+        xray_reproj_size=int(cfg.xray_reproj_size),
+        xray_nodet_counts_z=float(cfg.xray_nodet_counts_z),
+        xray_unobs_counts_z=float(cfg.xray_unobs_counts_z),
+        xray_unobs_exposure=float(cfg.xray_unobs_exposure),
+        xray_exposure_ref_cm2=float(cfg.xray_exposure_ref_cm2),
         map_fov_mpc=float(cfg.map_fov_mpc),
-        xray_map_channels="(mosaic_z, counts_z, xray_mask, density_mask)",
+        xray_map_channels="(counts_z, xray_mask, expmap)",
         xray_scalar_columns="(z_lens, log10 t_exp_ks, log10 xray_mpc_per_pix)",
     )
 
     trained_state, train_losses, test_losses, diffusion_cfg = train_model(
-        train_data=train_data,
-        test_data=test_data,
+        data=data,
+        train_idx=train_idx,
+        val_idx=val_idx,
         model=model,
         batch_size=batch_size,
         num_train_steps=num_train_steps,
@@ -155,6 +168,7 @@ def main():
         num_diffusion_steps=num_diffusion_steps,
         beta_start=beta_start,
         beta_end=beta_end,
+        wandb_run_name=f"{suites}_N{N}",
         wandb_notes=wandb_notes,
         cfg_dict=cfg_dict,
         checkpoint_dir = "/home/habjan.e/TNG/Sandbox_notebooks/phase_space_recon/cond_diff_old_models/checkpoints",
@@ -163,7 +177,7 @@ def main():
         runtime_buffer_minutes = 15.0,
     )
 
-    out_dir = os.path.join(os.getcwd(), "conditional_diffusion_models")
+    out_dir = os.path.join(HERE, "conditional_diffusion_models")
     os.makedirs(out_dir, exist_ok=True)
 
     param_path = os.path.join(out_dir, f"cond_diffusion_params{suffix}.pkl")

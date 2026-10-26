@@ -1,4 +1,4 @@
-from typing import Dict, Iterator, Tuple, Optional
+from typing import Dict, Iterator, Tuple, Optional, Sequence
 import time
 import h5py
 import numpy as np
@@ -15,91 +15,153 @@ from flax import serialization
 import wandb
 
 
-def preload_hdf5_to_memory(file_path: str) -> Dict[str, np.ndarray]:
-    """
-    Load a full dataset file into memory.
+# Nominal standardization of the density cubes, shared by every suite and fixed
+# rather than measured, so a model's output can always be turned back into a
+# density: log10(rho / Msun Mpc^-3) = z * CUBE_LOG10_STD + CUBE_LOG10_MEAN.
+# Each dataset file stores its cubes z-scored with its own stats
+# (cube_log10_{mean,std}_N); load_datasets converts them to these.
+CUBE_LOG10_MEAN = 11.0
+CUBE_LOG10_STD = 1.0
+CUBE_FLOOR_VALUE = -5.0     # empty voxels (rho = 0), as in the dataset files
 
-    Fixed-shape data (images, cubes, member point cloud, targets) are stacked
-    into dense (n_samples, ...) arrays. The weak-lensing source point clouds
-    from the shape_dynamics files are RAGGED (variable N per sample) and are
-    returned as lists of arrays:
+# Source-catalog columns the model's SourceShapeEncoder consumes: e1, e2, ix,
+# iy, z_s, z_lens, cell_frac. The files also carry an 8th, coverage, which the
+# model does not use yet.
+N_SRC_FEATURES = 7
+
+
+def _suite_name(f: h5py.File, path: str) -> str:
+    """The file's simulation suite: its attr when written, else the file name."""
+    if "simulation_suite" in f.attrs:
+        return str(f.attrs["simulation_suite"])
+    return os.path.basename(path).split("_")[0].upper()
+
+
+def load_datasets(file_paths: Sequence[str], resolution: int,
+                  keys: Optional[Sequence[Optional[Sequence[str]]]] = None) -> Dict[str, np.ndarray]:
+    """
+    Load and pool several dataset files (e.g. BAHAMAS + FLAMINGO) at one
+    resolution N into memory. Only the _N datasets are read.
+
+    keys, if given, holds one entry per file: the sample group names to read
+    from it (e.g. ["000000", "000008"]), or None for all of them. The default
+    reads every sample of every file.
+
+    Dense fields are pre-allocated over all files and filled in place, so the
+    pooled set costs one copy (~55 GB at N = 128 for 5000 samples). Train/val
+    splits are index arrays into it (split_by_cluster), never copies.
+
+      images           (n, 3, N, N)    images_N
+      cubes            (n, N, N, N)    density_cube_N, re-standardized from each
+                                       file's stats to CUBE_LOG10_{MEAN,STD};
+                                       empty voxels stay at CUBE_FLOOR_VALUE
+      gal_features     (n, max_nodes, 4)
+      gal_pixel_coords (n, max_nodes, 2) gal_pixel_coords_N, on the N x N grid
+      mask             (n, max_nodes)
+      globals_phys     (n, 4)          log10 cube mass [Msun], axis a, b, c [Mpc]:
+                                       physical, so comparable across suites
+      suite, simulation, cluster_index, projection_index   per-sample labels
+
+    The weak-lensing source point clouds are RAGGED (variable count per
+    sample) and are lists of arrays:
       src_features [i]: (N_i, 7) float32  e1, e2, ix, iy, z_s, z_lens, cell_frac
       src_cell_id  [i]: (N_i,)   int32    iy*S + ix, rows pre-sorted by this
-      src_cell_ptr     : (n_samples, S*S+1) int32 CSR pointers; sample i's
-                         cell c holds src_features[i][ptr[i,c]:ptr[i,c+1]]
-    with S = metadata["shape_grid_size"]. Old h5 files without source data
-    load fine; the src_* / z_lens / n_sources keys are simply absent.
+      src_cell_ptr     : (n, S*S+1) int64 CSR pointers; sample i's cell c
+                         holds src_features[i][ptr[i,c]:ptr[i,c+1]]
+    with S = metadata["shape_grid_size"].
 
     The mock-Chandra maps are fixed-shape, so they stack densely:
-      xray_maps    : (n_samples, G, G, 4) float32, channels
-                     [mosaic_z, counts_z, xray_mask, density_mask]
-      xray_scalars : (n_samples, 3) float32, [z_lens, log10 t_exp_ks,
+      xray_maps    : (n, G, G, 3) float32, channels
+                     [counts_z, xray_mask, expmap], exactly as stored
+      xray_scalars : (n, 3) float32, [z_lens, log10 t_exp_ks,
                      log10 xray_mpc_per_pix]
-    mosaic and counts are already log10 z-scored by the dataset build.
-    density_mask is expmap > 0 -- whether the pixel was observed at all --
-    which is what separates the ~24% of the frame off the ACIS-I footprint
-    from a genuine non-detection; xray_mask cannot, since it folds expmap > 0
-    in already. Presence is keyed on xray_mask rather than xray_mosaic, so a
-    pre-standardization file (raw maps, no mask) is skipped rather than fed to
-    the model on the wrong scale.
+    counts_z is log10 z-scored by the dataset build and 0 wherever xray_mask
+    is 0; XrayEncoder rewrites those non-detections itself and takes
+    'observed' from expmap > 0, which separates the ~24% of the frame off the
+    ACIS-I footprint from a genuine non-detection. xray_mosaic is not loaded:
+    it is counts / (expmap * t_exp * pixel area), so it adds nothing. The
+    X-ray inputs use fixed constants in every build, so they pool as stored.
     """
-    print(f"\nPreloading {file_path} into memory...")
+    N = int(resolution)
+    print(f"\nLoading {len(file_paths)} file(s) at N={N}...")
     start = time.time()
 
-    with h5py.File(file_path, "r") as f:
-        sample_ids = sorted(f.keys())
-        n_samples = len(sample_ids)
-        first = f[sample_ids[0]]
+    if keys is None:
+        keys = [None] * len(file_paths)
+    if len(keys) != len(file_paths):
+        raise ValueError(f"keys has {len(keys)} entries for {len(file_paths)} files")
 
-        images = np.zeros((n_samples, *first["images"].shape), dtype=np.float32)
-        cubes = np.zeros((n_samples, *first["density_cube"].shape), dtype=np.float32)
-        gal_features = np.zeros((n_samples, *first["gal_features"].shape), dtype=np.float32)
-        gal_targets = np.zeros((n_samples, *first["gal_targets"].shape), dtype=np.float32)
-        gal_pixel_coords = np.zeros((n_samples, *first["gal_pixel_coords"].shape), dtype=np.float32)
-        mask = np.zeros((n_samples, *first["mask"].shape), dtype=np.float32)
-        globals_target = np.zeros((n_samples, *first["globals_target"].shape), dtype=np.float32)
+    # Pass 1: sizes, and the settings every file must share to be pooled.
+    n_per_file, suites, metas, keys_per_file = [], [], [], []
+    for p, k in zip(file_paths, keys):
+        with h5py.File(p, "r") as f:
+            if N not in [int(r) for r in f.attrs["resolutions"]]:
+                raise ValueError(f"{p} has resolutions {list(f.attrs['resolutions'])}, not {N}")
+            k = sorted(f.keys()) if k is None else sorted(str(s) for s in k)
+            missing = [s for s in k if s not in f]
+            if missing:
+                raise KeyError(f"{p} has no samples {missing[:5]}")
+            keys_per_file.append(k)
+            n_per_file.append(len(k))
+            suites.append(_suite_name(f, p))
+            metas.append({k: f.attrs[k] for k in f.attrs.keys()})
+    for key in ("map_fov_mpc", "shape_grid_size", "xray_grid_size", "max_nodes", "floor_value"):
+        vals = {str(m.get(key)) for m in metas}
+        if len(vals) > 1:
+            raise ValueError(f"files disagree on {key}: {vals}")
+    n = int(sum(n_per_file))
 
-        cluster_index = np.zeros((n_samples,), dtype=np.int32)
-        simulation = []
+    with h5py.File(file_paths[0], "r") as f:
+        first = f[keys_per_file[0][0]]
+        shp = {k: first[k].shape for k in
+               (f"images_{N}", f"density_cube_{N}", "gal_features",
+                f"gal_pixel_coords_{N}", "mask", "src_cell_ptr", "xray_counts")}
+    G = shp["xray_counts"][0]
 
-        has_src = "src_features" in first
-        if has_src:
-            src_features = []
-            src_cell_id = []
-            src_cell_ptr = np.zeros((n_samples, *first["src_cell_ptr"].shape), dtype=np.int32)
-            z_lens = np.zeros((n_samples,), dtype=np.float32)
-            n_sources = np.zeros((n_samples,), dtype=np.int64)
+    images = np.zeros((n, *shp[f"images_{N}"]), dtype=np.float32)
+    cubes = np.zeros((n, *shp[f"density_cube_{N}"]), dtype=np.float32)
+    gal_features = np.zeros((n, *shp["gal_features"]), dtype=np.float32)
+    gal_pixel_coords = np.zeros((n, *shp[f"gal_pixel_coords_{N}"]), dtype=np.float32)
+    mask = np.zeros((n, *shp["mask"]), dtype=np.float32)
+    globals_phys = np.zeros((n, 4), dtype=np.float32)
+    src_features, src_cell_id = [], []
+    src_cell_ptr = np.zeros((n, *shp["src_cell_ptr"]), dtype=np.int64)
+    n_sources = np.zeros((n,), dtype=np.int64)
+    xray_maps = np.zeros((n, G, G, 3), dtype=np.float32)
+    xray_scalars = np.zeros((n, 3), dtype=np.float32)
+    suite, simulation, sample_key = [], [], []
+    cluster_index = np.zeros((n,), dtype=np.int32)
+    projection_index = np.zeros((n,), dtype=np.int32)
 
-        # xray_mask exists only in standardized files, so it is the right test:
-        # it guarantees mosaic/counts are the log10 z-scores XrayEncoder expects.
-        has_xray = "xray_mask" in first
-        if has_xray:
-            G = int(first["xray_mosaic"].shape[0])
-            xray_maps = np.zeros((n_samples, G, G, 4), dtype=np.float32)
-            xray_scalars = np.zeros((n_samples, 3), dtype=np.float32)
-
-        for i, sid in enumerate(sample_ids):
-            g = f[sid]
-            images[i] = g["images"][:]
-            cubes[i] = g["density_cube"][:]
-            gal_features[i] = g["gal_features"][:]
-            gal_targets[i] = g["gal_targets"][:]
-            gal_pixel_coords[i] = g["gal_pixel_coords"][:]
-            mask[i] = g["mask"][:]
-            globals_target[i] = g["globals_target"][:]
-            cluster_index[i] = g.attrs["cluster_index"]
-            simulation.append(str(g.attrs["simulation"]))
-            if has_src:
-                src_features.append(g["src_features"][:])
+    # Pass 2: fill.
+    i = 0
+    for p, s_name, meta, k in zip(file_paths, suites, metas, keys_per_file):
+        mean_N = float(meta[f"cube_log10_mean_{N}"])
+        std_N = float(meta[f"cube_log10_std_{N}"])
+        floor_file = float(meta["floor_value"])
+        with h5py.File(p, "r") as f:
+            for sid in k:
+                g = f[sid]
+                images[i] = g[f"images_{N}"][:]
+                z = g[f"density_cube_{N}"][:]
+                empty = z <= floor_file + 1e-6
+                z = (z * std_N + (mean_N - CUBE_LOG10_MEAN)) / CUBE_LOG10_STD
+                z = np.maximum(z, CUBE_FLOOR_VALUE)
+                z[empty] = CUBE_FLOOR_VALUE
+                cubes[i] = z
+                gal_features[i] = g["gal_features"][:]
+                gal_pixel_coords[i] = g[f"gal_pixel_coords_{N}"][:]
+                mask[i] = g["mask"][:]
+                globals_phys[i, 0] = g["cube_mass_log10_msun"][()]
+                globals_phys[i, 1:] = g["axis_lengths_mpc"][:]
+                src_features.append(
+                    np.ascontiguousarray(g["src_features"][:, :N_SRC_FEATURES]))
                 src_cell_id.append(g["src_cell_id"][:])
                 src_cell_ptr[i] = g["src_cell_ptr"][:]
-                z_lens[i] = g.attrs["z_lens"]
                 n_sources[i] = g.attrs["n_sources"]
-            if has_xray:
-                xray_maps[i, ..., 0] = g["xray_mosaic"][:]
-                xray_maps[i, ..., 1] = g["xray_counts"][:]
-                xray_maps[i, ..., 2] = g["xray_mask"][:]
-                xray_maps[i, ..., 3] = g["xray_expmap"][:] > 0.0   # density_mask
+                xray_maps[i, ..., 0] = g["xray_counts"][:]
+                xray_maps[i, ..., 1] = g["xray_mask"][:]
+                xray_maps[i, ..., 2] = g["xray_expmap"][:]
                 # Raw, not rescaled: XrayEncoder does its own O(1) scaling, and
                 # it reconstructs the pixel scale as 10**scalars[:, 2].
                 xray_scalars[i] = (
@@ -107,63 +169,78 @@ def preload_hdf5_to_memory(file_path: str) -> Dict[str, np.ndarray]:
                     np.log10(g.attrs["xray_t_exp_ks"]),
                     np.log10(g.attrs["xray_mpc_per_pix"]),
                 )
+                suite.append(s_name)
+                simulation.append(str(g.attrs["simulation"]))
+                sample_key.append(sid)
+                cluster_index[i] = g.attrs["cluster_index"]
+                projection_index[i] = g.attrs["projection_index"]
+                i += 1
+        print(f"  {s_name}: {os.path.basename(p)}, {n_per_file[suites.index(s_name)]} samples "
+              f"(cube stats {mean_N:.3f}/{std_N:.3f} -> nominal "
+              f"{CUBE_LOG10_MEAN}/{CUBE_LOG10_STD})", flush=True)
 
-        metadata = {k: f.attrs[k] for k in f.attrs.keys()}
+    metadata = dict(metas[0])
+    metadata.update(resolution=N, files=list(file_paths), suites=list(suites),
+                    cube_log10_mean=CUBE_LOG10_MEAN, cube_log10_std=CUBE_LOG10_STD,
+                    cube_floor_value=CUBE_FLOOR_VALUE)
 
-    elapsed = time.time() - start
-    size_b = (
-        images.nbytes
-        + cubes.nbytes
-        + gal_features.nbytes
-        + gal_targets.nbytes
-        + gal_pixel_coords.nbytes
-        + mask.nbytes
-        + globals_target.nbytes
-    )
-    if has_src:
-        size_b += (sum(a.nbytes for a in src_features)
-                   + sum(a.nbytes for a in src_cell_id)
-                   + src_cell_ptr.nbytes)
-    if has_xray:
-        size_b += xray_maps.nbytes + xray_scalars.nbytes
-    print(f"✓ Loaded {n_samples} samples in {elapsed:.2f}s ({size_b / 1e9:.2f} GB)")
-    if has_src:
-        print(f"  sources/sample: min={n_sources.min()}, "
-              f"median={int(np.median(n_sources))}, max={n_sources.max()}; "
-              f"shape grid {int(metadata['shape_grid_size'])}"
-              f"x{int(metadata['shape_grid_size'])}")
-    if has_xray:
-        det = xray_maps[..., 2].mean(axis=(1, 2))
-        obs = xray_maps[..., 3].mean(axis=(1, 2))
-        t_exp = 10.0 ** xray_scalars[:, 1]
-        print(f"  xray {G}x{G} ({xray_maps.nbytes / 1e9:.2f} GB): detected frac "
-              f"min={det.min():.3f}, median={np.median(det):.3f}, max={det.max():.3f}; "
-              f"observed frac median={np.median(obs):.3f}; "
-              f"t_exp {t_exp.min():.0f}-{t_exp.max():.0f} ks")
+    size_b = (images.nbytes + cubes.nbytes + gal_features.nbytes + gal_pixel_coords.nbytes
+              + mask.nbytes + src_cell_ptr.nbytes + xray_maps.nbytes
+              + sum(a.nbytes for a in src_features) + sum(a.nbytes for a in src_cell_id))
+    det = xray_maps[..., 1].mean(axis=(1, 2))
+    obs = (xray_maps[..., 2] > 0.0).mean(axis=(1, 2))
+    print(f"✓ Loaded {n} samples in {time.time() - start:.1f}s ({size_b / 1e9:.2f} GB)")
+    print(f"  sources/sample: min={n_sources.min()}, median={int(np.median(n_sources))}, "
+          f"max={n_sources.max()}; shape grid {int(metadata['shape_grid_size'])}^2")
+    print(f"  xray {G}x{G}: detected frac median={np.median(det):.3f}, observed frac "
+          f"median={np.median(obs):.3f}; t_exp {10 ** xray_scalars[:, 1].min():.0f}-"
+          f"{10 ** xray_scalars[:, 1].max():.0f} ks")
+    print(f"  cubes: floor-voxel frac {np.mean(cubes <= CUBE_FLOOR_VALUE):.4f}, "
+          f"non-floor z range {cubes[cubes > CUBE_FLOOR_VALUE].min():.2f}.."
+          f"{cubes.max():.2f}")
 
-    out = dict(
+    return dict(
         images=images,
         cubes=cubes,
         gal_features=gal_features,
-        gal_targets=gal_targets,
         gal_pixel_coords=gal_pixel_coords,
         mask=mask,
-        globals_target=globals_target,
-        cluster_index=cluster_index,
+        globals_phys=globals_phys,
+        src_features=src_features,
+        src_cell_id=src_cell_id,
+        src_cell_ptr=src_cell_ptr,
+        n_sources=n_sources,
+        xray_maps=xray_maps,
+        xray_scalars=xray_scalars,
+        suite=np.array(suite),
         simulation=np.array(simulation),
+        sample_key=np.array(sample_key),
+        cluster_index=cluster_index,
+        projection_index=projection_index,
         metadata=metadata,
     )
-    if has_src:
-        out.update(
-            src_features=src_features,
-            src_cell_id=src_cell_id,
-            src_cell_ptr=src_cell_ptr,
-            z_lens=z_lens,
-            n_sources=n_sources,
-        )
-    if has_xray:
-        out.update(xray_maps=xray_maps, xray_scalars=xray_scalars)
-    return out
+
+
+def split_by_cluster(data: Dict[str, np.ndarray], val_frac: float = 0.2,
+                     seed: int = 0) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Train/val sample indices, split by cluster rather than by sample: every
+    projection of a cluster, in every run of its suite, lands on the same side.
+    The same halo index recurs across a suite's runs (shared initial
+    conditions), so the group key is (suite, cluster_index). Each suite is
+    split val_frac separately, so both are represented in both splits.
+    """
+    rng = np.random.default_rng(seed)
+    is_val = np.zeros(len(data["suite"]), dtype=bool)
+    for s in sorted(set(data["suite"])):
+        in_s = data["suite"] == s
+        clusters = np.unique(data["cluster_index"][in_s])
+        n_val = int(round(val_frac * len(clusters)))
+        val_clusters = rng.choice(clusters, size=n_val, replace=False)
+        is_val |= in_s & np.isin(data["cluster_index"], val_clusters)
+        print(f"  split {s}: {len(clusters) - n_val} train / {n_val} val clusters "
+              f"({np.sum(in_s & ~is_val)} / {np.sum(in_s & is_val)} samples)")
+    return np.flatnonzero(~is_val), np.flatnonzero(is_val)
 
 
 def make_src_batch(
@@ -207,9 +284,14 @@ def data_loader(
     shuffle: bool = True,
     n_src_pad: Optional[int] = None,
     grid_size: Optional[int] = None,
+    indices: Optional[np.ndarray] = None,
 ) -> Iterator[Tuple[jnp.ndarray, ...]]:
-    n = data["images"].shape[0]
-    idx = np.arange(n)
+    """
+    Batches over `indices` (a split from split_by_cluster; all samples when
+    None) of the pooled data from load_datasets.
+    """
+    idx = np.arange(data["images"].shape[0]) if indices is None else np.array(indices)
+    n = idx.size
     if shuffle:
         rng.shuffle(idx)
 
@@ -243,7 +325,7 @@ def data_loader(
         # passes through jit and reaches XrayEncoder's `is not None` guard,
         # at the cost of one extra compile for that batch shape.
         if "xray_maps" in data:
-            xray_maps = jnp.asarray(data["xray_maps"][bidx])       # (B,G,G,4)
+            xray_maps = jnp.asarray(data["xray_maps"][bidx])       # (B,G,G,3)
             xray_scalars = jnp.asarray(data["xray_scalars"][bidx])  # (B,3)
         else:
             xray_maps = None
@@ -264,10 +346,11 @@ def data_loader(
 
 
 def infinite_data_loader(data, batch_size, rng, shuffle=True,
-                         n_src_pad=None, grid_size=None):
+                         n_src_pad=None, grid_size=None, indices=None):
     while True:
         yield from data_loader(data, batch_size=batch_size, rng=rng, shuffle=shuffle,
-                               n_src_pad=n_src_pad, grid_size=grid_size)
+                               n_src_pad=n_src_pad, grid_size=grid_size,
+                               indices=indices)
 
 
 def make_beta_schedule(T: int, beta_start: float = 1e-4, beta_end: float = 2e-2):
@@ -445,7 +528,7 @@ def sample_ddpm(
     src_cell_id:      (B,Ns)
     src_log_count:    (B,S,S,1)
     sample_shape:     (B,Z,Y,X,1)
-    xray_maps:        (B,G,G,4) or None
+    xray_maps:        (B,G,G,3) or None
     xray_scalars:     (B,3) or None
 
     Keyword-only at the end so existing positional callers keep working; pass
@@ -493,8 +576,9 @@ def sample_ddpm(
 
 
 def train_model(
-    train_data: Dict[str, np.ndarray],
-    test_data: Dict[str, np.ndarray],
+    data: Dict[str, np.ndarray],
+    train_idx: np.ndarray,
+    val_idx: np.ndarray,
     model,
     batch_size: int = 2,
     num_train_steps: int = 100_000,
@@ -507,6 +591,7 @@ def train_model(
     beta_start: float = 1e-4,
     beta_end: float = 2e-2,
     wandb_project: str = "conditional-3d-diffusion",
+    wandb_run_name: Optional[str] = None,
     wandb_notes: str = "",
     cfg_dict: Optional[dict] = None,
     checkpoint_dir: str = "./runtime_checkpoints",
@@ -518,7 +603,11 @@ def train_model(
     rng_key, init_key = jax.random.split(rng_key)
 
     train_rng = np.random.default_rng(42)
-    test_rng = np.random.default_rng(123)
+    # One validation stream per suite, so each suite's loss is reported on its
+    # own; val_loss is their sample-weighted mean.
+    val_suites = sorted(set(data["suite"][val_idx]))
+    val_idx_by_suite = {s: val_idx[data["suite"][val_idx] == s] for s in val_suites}
+    val_rngs = {s: np.random.default_rng(123 + k) for k, s in enumerate(val_suites)}
 
     os.makedirs(checkpoint_dir, exist_ok=True)
 
@@ -537,20 +626,24 @@ def train_model(
 
     # Shared padded source-cloud size across train and eval so every batch has
     # identical shapes (one jit compile of each step function).
-    n_src_pad = int(max(np.max(train_data["n_sources"]), np.max(test_data["n_sources"])))
-    grid_size = int(train_data["metadata"]["shape_grid_size"])
+    n_src_pad = int(np.max(data["n_sources"]))
+    grid_size = int(data["metadata"]["shape_grid_size"])
     print(f"source clouds padded to n_src_pad={n_src_pad}, shape grid {grid_size}x{grid_size}")
+    print(f"train {len(train_idx)} samples; val " + ", ".join(
+        f"{s} {len(v)}" for s, v in val_idx_by_suite.items()))
 
-    train_stream = infinite_data_loader(train_data, batch_size, rng=train_rng, shuffle=True,
-                                        n_src_pad=n_src_pad, grid_size=grid_size)
+    train_stream = infinite_data_loader(data, batch_size, rng=train_rng, shuffle=True,
+                                        n_src_pad=n_src_pad, grid_size=grid_size,
+                                        indices=train_idx)
     example_batch = next(
         data_loader(
-            train_data,
+            data,
             batch_size=min(batch_size, 2),
             rng=train_rng,
             shuffle=False,
             n_src_pad=n_src_pad,
             grid_size=grid_size,
+            indices=train_idx,
         )
     )
 
@@ -559,6 +652,7 @@ def train_model(
     run = wandb.init(
         entity="erichabjan-northeastern-university",
         project=wandb_project,
+        name=wandb_run_name,
         config=dict(
             learning_rate=str(learning_rate),
             grad_clipping=float(grad_clipping),
@@ -593,7 +687,15 @@ def train_model(
             step=int(step),
             train_losses=np.asarray(train_losses, dtype=np.float32),
             test_losses=np.asarray(test_losses, dtype=np.float32),
+            val_losses_by_suite={s: np.asarray(v, dtype=np.float32)
+                                 for s, v in val_losses_by_suite.items()},
             diffusion_cfg=diffusion_cfg,
+            # What a prediction means: log10 rho = z * std + mean.
+            cube_log10_mean=float(data["metadata"]["cube_log10_mean"]),
+            cube_log10_std=float(data["metadata"]["cube_log10_std"]),
+            resolution=int(data["metadata"]["resolution"]),
+            train_idx=np.asarray(train_idx),
+            val_idx=np.asarray(val_idx),
             reason=str(reason),
             wandb_run_id=None if run is None else run.id,
         )
@@ -607,38 +709,45 @@ def train_model(
         print(f"  reason: {reason}")
 
     def eval_loop():
-        total = 0.0
-        count = 0
-        it = data_loader(test_data, batch_size=batch_size, rng=test_rng, shuffle=True,
-                         n_src_pad=n_src_pad, grid_size=grid_size)
-
-        if num_eval_batches is None:
-            for batch in it:
-                nonlocal_rng = jax.random.PRNGKey(1000 + count)
-                loss = eval_step(
-                    state, *batch,
-                    nonlocal_rng, alpha_bars, num_diffusion_steps
-                )
-                total += float(loss)
-                count += 1
-        else:
-            for k in range(num_eval_batches):
-                try:
-                    batch = next(it)
-                except StopIteration:
+        """
+        Validation loss per suite (num_eval_batches batches each, or all of
+        them when None), and the sample-weighted mean over suites.
+        """
+        per_suite, n_seen = {}, {}
+        for s_name in val_suites:
+            total, count, n_s = 0.0, 0, 0
+            it = data_loader(data, batch_size=batch_size, rng=val_rngs[s_name], shuffle=True,
+                             n_src_pad=n_src_pad, grid_size=grid_size,
+                             indices=val_idx_by_suite[s_name])
+            for k, batch in enumerate(it):
+                if num_eval_batches is not None and k >= num_eval_batches:
                     break
-                nonlocal_rng = jax.random.PRNGKey(1000 + k)
                 loss = eval_step(
                     state, *batch,
-                    nonlocal_rng, alpha_bars, num_diffusion_steps
+                    jax.random.PRNGKey(1000 + k), alpha_bars, num_diffusion_steps
                 )
-                total += float(loss)
-                count += 1
+                b = int(batch[1].shape[0])
+                total += float(loss) * b
+                n_s += b
+            per_suite[s_name] = total / max(n_s, 1)
+            n_seen[s_name] = n_s
+        overall = sum(per_suite[s] * n_seen[s] for s in val_suites) / max(sum(n_seen.values()), 1)
+        return overall, per_suite
 
-        return total / max(count, 1)
+    def log_val(step, label="val_loss"):
+        loss_val, per_suite = eval_loop()
+        test_losses.append(loss_val)
+        for s_name, v in per_suite.items():
+            val_losses_by_suite[s_name].append(v)
+        print(f"Step {step} | {label}: {loss_val:.6f} | " + " | ".join(
+            f"{s_name}: {v:.6f}" for s_name, v in per_suite.items()))
+        run.log({"val_loss": loss_val,
+                 **{f"val_loss_{s_name}": v for s_name, v in per_suite.items()},
+                 "step": step}, step=step)
 
     train_losses = []
     test_losses = []
+    val_losses_by_suite = {s: [] for s in val_suites}
 
     start_time = time.time()
     soft_limit_seconds = max_runtime_hours * 3600.0
@@ -666,10 +775,7 @@ def train_model(
             print(f"Step {step} | train_loss: {loss_train:.6f} | elapsed: {elapsed_hours:.2f} hr")
 
         if step % eval_every == 0:
-            loss_val = eval_loop()
-            test_losses.append(loss_val)
-            print(f"Step {step} | val_loss: {loss_val:.6f}")
-            run.log({"val_loss": loss_val, "step": step}, step=step)
+            log_val(step)
 
         # Check walltime after the step has fully completed
         elapsed_seconds = time.time() - start_time
@@ -685,10 +791,7 @@ def train_model(
             # Optional: run one last validation before saving if you want
             # and if this step was not already an eval step.
             if step % eval_every != 0:
-                loss_val = eval_loop()
-                test_losses.append(loss_val)
-                print(f"Final pre-exit val_loss at step {step}: {loss_val:.6f}")
-                run.log({"val_loss": loss_val, "step": step}, step=step)
+                log_val(step, label="final pre-exit val_loss")
 
             save_runtime_checkpoint(
                 state=state,

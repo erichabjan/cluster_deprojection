@@ -7,6 +7,12 @@
 #SBATCH --gres=gpu:a100:1
 #SBATCH --cpus-per-task=4
 
+# One cube resolution per job: sbatch run_train_conditional_diffusion.slurm N
+# with N in 16 32 64 128. submit_train_resolutions.sh submits all four, with
+# per-N memory and log names; the #SBATCH lines above are the N <= 64 defaults.
+RES=${1:?usage: sbatch run_train_conditional_diffusion.slurm <N: 16|32|64|128>}
+echo "Cube resolution N=$RES"
+
 # Load CUDA module
 module load cuda/12.3.0
 
@@ -32,6 +38,8 @@ echo "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
 echo "LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
 nvidia-smi
 
-python -c "import jax; print('JAX version:', jax.__version__); print('Available devices:', jax.devices()); print('Using GPU:', any(d.platform == 'gpu' for d in jax.devices()))"
+"$CONDA_PREFIX/bin/python" -c "import jax; print('JAX version:', jax.__version__); print('Available devices:', jax.devices()); print('Using GPU:', any(d.platform == 'gpu' for d in jax.devices()))"
 
-python3 /home/habjan.e/TNG/cluster_deprojection/conditional_diffusion_model/run_conditional_diffusion.py
+# The env's interpreter by absolute path: `conda activate` can leave the shared
+# Anaconda ahead of the env in PATH, so a bare python3 may not be cl_dyn.
+"$CONDA_PREFIX/bin/python" /home/habjan.e/TNG/cluster_deprojection/conditional_diffusion_model/run_conditional_diffusion.py --resolution "$RES"
